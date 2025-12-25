@@ -1,0 +1,496 @@
+#!/usr/bin/env bb
+
+(require '[clojure.edn :as edn]
+         '[clojure.string :as str]
+         '[clojure.java.io :as io]
+         '[babashka.process :as p])
+
+;; === Configuration ===
+
+(def default-config-path "/etc/ztrbk.conf")
+
+(defn load-config [path]
+  (edn/read-string (slurp path)))
+
+;; === ZFS Operations ===
+
+(defn run-cmd [cmd]
+  (let [result (p/shell {:out :string :err :string :continue true} cmd)]
+    (when-not (zero? (:exit result))
+      (throw (ex-info "Command failed" {:cmd cmd :result result})))
+    (str/trim (:out result))))
+
+(defn run-cmd-safe [cmd]
+  (try
+    (run-cmd cmd)
+    (catch Exception e nil)))
+
+(defn list-snapshots [dataset]
+  (let [output (run-cmd-safe (str "zfs list -H -t snapshot -o name -r " dataset))]
+    (if output
+      (str/split-lines output)
+      [])))
+
+(defn snapshot-exists? [snapshot-name]
+  (zero? (:exit (p/shell {:continue true :out :string} 
+                         (str "zfs list -H -t snapshot " snapshot-name)))))
+
+(defn create-snapshot [dataset timestamp prefix]
+  (let [snapshot-name (str dataset "@" prefix timestamp)]
+    (println "Creating snapshot:" snapshot-name)
+    (run-cmd (str "zfs snapshot " snapshot-name))
+    snapshot-name))
+
+(defn destroy-snapshot [snapshot-name]
+  (println "Destroying snapshot:" snapshot-name)
+  (run-cmd (str "zfs destroy " snapshot-name)))
+
+(defn send-snapshot 
+  ([snapshot-name remote-dataset ssh-host]
+   (send-snapshot snapshot-name remote-dataset ssh-host nil))
+  ([snapshot-name remote-dataset ssh-host incremental-base]
+   (let [dataset (first (str/split snapshot-name #"@"))
+         snapshot (second (str/split snapshot-name #"@"))
+         remote-snapshot (str remote-dataset "@" snapshot)
+         
+         ;; Check if snapshot already exists on remote
+         check-cmd (if ssh-host
+                    (str "ssh " ssh-host " zfs list -H -t snapshot " remote-snapshot)
+                    (str "zfs list -H -t snapshot " remote-snapshot))
+         exists? (zero? (:exit (p/shell {:continue true :out :string} check-cmd)))]
+     
+     (when exists?
+       (println "Snapshot already exists on remote:" remote-snapshot)
+       (throw (ex-info "Remote snapshot exists" {:snapshot remote-snapshot})))
+     
+     (println "Sending snapshot:" snapshot-name "to" (or ssh-host "local") remote-dataset)
+     
+     (let [send-cmd (if incremental-base
+                     (str "zfs send -i " incremental-base " " snapshot-name)
+                     (str "zfs send " snapshot-name))
+           recv-cmd (if ssh-host
+                     (str "ssh " ssh-host " zfs receive -F " remote-dataset)
+                     (str "zfs receive -F " remote-dataset))
+           full-cmd (str send-cmd " | " recv-cmd)]
+       (run-cmd full-cmd)))))
+
+;; === Timestamp Parsing ===
+
+(defn parse-timestamp [ts-str]
+  (try
+    (java.time.LocalDateTime/parse ts-str
+      (java.time.format.DateTimeFormatter/ofPattern "yyyyMMdd-HHmmss"))
+    (catch Exception e nil)))
+
+(defn parse-snapshot-timestamp [snapshot-name prefix]
+  (when-let [snap-part (second (str/split snapshot-name #"@"))]
+    (when (str/starts-with? snap-part prefix)
+      (let [ts-str (subs snap-part (count prefix))]
+        (parse-timestamp ts-str)))))
+
+;; === Retention Policy (btrbk-style) ===
+
+(defn parse-preserve-min [spec]
+  "Parse preserve_min specs: all, latest, no, or <number>{h,d,w,m,y}"
+  (cond
+    (= spec "all") {:type :all}
+    (= spec "latest") {:type :latest}
+    (= spec "no") {:type :no}
+    :else
+    (when-let [match (re-matches #"(\d+)([hdwmy])" (str spec))]
+      (let [[_ amount unit-char] match
+            amount (Integer/parseInt amount)
+            unit (case unit-char
+                   "h" :hours
+                   "d" :days
+                   "w" :weeks
+                   "m" :months
+                   "y" :years)]
+        {:type :duration :amount amount :unit unit}))))
+
+(defn parse-preserve [spec]
+  "Parse preserve specs: no or [<hourly>h] [<daily>d] [<weekly>w] [<monthly>m] [<yearly>y]"
+  (if (= spec "no")
+    nil
+    (let [parts (str/split (str spec) #"\s+")
+          parse-part (fn [part]
+                      (when-let [match (re-matches #"(\d+|\*)([hdwmy])" part)]
+                        (let [[_ amount unit-char] match
+                              amount (if (= amount "*") :all (Integer/parseInt amount))
+                              unit (case unit-char
+                                     "h" :hourly
+                                     "d" :daily
+                                     "w" :weekly
+                                     "m" :monthly
+                                     "y" :yearly)]
+                          [unit amount])))]
+      (into {} (keep parse-part parts)))))
+
+(defn time-ago [duration-amount duration-unit]
+  (let [now (java.time.LocalDateTime/now)]
+    (case duration-unit
+      :hours (.minusHours now duration-amount)
+      :days (.minusDays now duration-amount)
+      :weeks (.minusWeeks now duration-amount)
+      :months (.minusMonths now duration-amount)
+      :years (.minusYears now duration-amount))))
+
+(defn get-period-key [timestamp period hour-of-day day-of-week]
+  "Get a key that groups snapshots by their period"
+  (case period
+    :hourly [(.getYear timestamp) (.getDayOfYear timestamp) (.getHour timestamp)]
+    :daily [(.getYear timestamp) (.getDayOfYear timestamp)]
+    :weekly [(.getYear timestamp) (.. timestamp (get java.time.temporal.WeekFields/ISO weekOfWeekBasedYear))]
+    :monthly [(.getYear timestamp) (.getMonthValue timestamp)]
+    :yearly [(.getYear timestamp)]))
+
+(defn is-daily-backup? [timestamp hour-of-day]
+  (>= (.getHour timestamp) hour-of-day))
+
+(defn is-weekly-backup? [timestamp day-of-week]
+  (let [dow-map {:monday 1 :tuesday 2 :wednesday 3 :thursday 4 
+                 :friday 5 :saturday 6 :sunday 7}
+        target-dow (get dow-map day-of-week 7)
+        actual-dow (.getValue (.getDayOfWeek timestamp))]
+    (= actual-dow target-dow)))
+
+(defn snapshot-age-duration [snapshot-ts]
+  (java.time.Duration/between snapshot-ts (java.time.LocalDateTime/now)))
+
+(defn within-preserve-min? [snapshot-ts preserve-min-spec]
+  "Check if snapshot falls within preserve_min duration"
+  (case (:type preserve-min-spec)
+    :all true
+    :latest false  ;; handled separately
+    :no false
+    :duration
+    (let [{:keys [amount unit]} preserve-min-spec
+          cutoff-time (time-ago amount unit)]
+      (.isAfter snapshot-ts cutoff-time))))
+
+(defn apply-btrbk-retention [snapshots prefix preserve-min-spec preserve-spec 
+                             hour-of-day day-of-week]
+  "Apply btrbk-style retention policy"
+  (let [;; Parse snapshot timestamps
+        snaps-with-ts (keep (fn [snap]
+                             (when-let [ts (parse-snapshot-timestamp snap prefix)]
+                               {:snapshot snap :timestamp ts}))
+                           snapshots)
+        
+        ;; Sort by timestamp (newest first)
+        sorted-snaps (reverse (sort-by :timestamp snaps-with-ts))
+        
+        ;; First, check preserve_min
+        preserved-by-min (if (= (:type preserve-min-spec) :all)
+                          (set (map :snapshot snaps-with-ts))
+                          (if (= (:type preserve-min-spec) :latest)
+                            #{(:snapshot (first sorted-snaps))}
+                            (set (map :snapshot 
+                                     (filter #(within-preserve-min? 
+                                              (:timestamp %) preserve-min-spec)
+                                            snaps-with-ts)))))
+        
+        ;; Then apply preserve policy (if any)
+        preserved-by-policy
+        (if (or (nil? preserve-spec) 
+                (= (:type preserve-min-spec) :all))
+          #{}
+          (let [now (java.time.LocalDateTime/now)
+                
+                ;; Helper to find snapshots for a period
+                find-for-period
+                (fn [period keep-count]
+                  (when keep-count
+                    (let [candidates
+                          (case period
+                            :hourly snaps-with-ts
+                            :daily (filter #(is-daily-backup? (:timestamp %) hour-of-day) 
+                                          snaps-with-ts)
+                            :weekly (filter #(and (is-daily-backup? (:timestamp %) hour-of-day)
+                                                 (is-weekly-backup? (:timestamp %) day-of-week))
+                                           snaps-with-ts)
+                            :monthly (filter #(and (is-daily-backup? (:timestamp %) hour-of-day)
+                                                  (is-weekly-backup? (:timestamp %) day-of-week))
+                                            snaps-with-ts)
+                            :yearly (filter #(and (is-daily-backup? (:timestamp %) hour-of-day)
+                                                 (is-weekly-backup? (:timestamp %) day-of-week))
+                                           snaps-with-ts))
+                          
+                          grouped (group-by #(get-period-key (:timestamp %) period 
+                                                            hour-of-day day-of-week) 
+                                          candidates)
+                          
+                          ;; Get newest from each period
+                          period-keepers (map (fn [[_ snaps]]
+                                               (first (sort-by :timestamp #(compare %2 %1) snaps)))
+                                             grouped)
+                          
+                          ;; Sort by timestamp and take requested count
+                          sorted-keepers (reverse (sort-by :timestamp period-keepers))
+                          final (if (= keep-count :all)
+                                 sorted-keepers
+                                 (take keep-count sorted-keepers))]
+                      (set (map :snapshot final)))))
+                
+                hourly-preserved (find-for-period :hourly (:hourly preserve-spec))
+                daily-preserved (find-for-period :daily (:daily preserve-spec))
+                weekly-preserved (find-for-period :weekly (:weekly preserve-spec))
+                monthly-preserved (find-for-period :monthly (:monthly preserve-spec))
+                yearly-preserved (find-for-period :yearly (:yearly preserve-spec))]
+            
+            (into #{} (concat hourly-preserved daily-preserved weekly-preserved 
+                            monthly-preserved yearly-preserved))))
+        
+        ;; Combine both sets
+        all-preserved (into preserved-by-min preserved-by-policy)
+        all-snapshot-names (set (map :snapshot snaps-with-ts))
+        to-destroy (remove all-preserved all-snapshot-names)]
+    
+    {:keep (vec all-preserved)
+     :destroy (vec to-destroy)}))
+
+(defn filter-managed-snapshots [snapshots prefix]
+  (filter #(parse-snapshot-timestamp % prefix) snapshots))
+
+(defn get-timestamp []
+  (let [now (java.time.LocalDateTime/now)]
+    (.format now (java.time.format.DateTimeFormatter/ofPattern "yyyyMMdd-HHmmss"))))
+
+;; === Volume Configuration ===
+
+(defn process-volume [vol-config global-defaults dry-run?]
+  (let [{:keys [source snapshot-name snapshot-preserve snapshot-preserve-min]} vol-config
+        prefix (or snapshot-name (:snapshot-name global-defaults) "ztrbk_")
+        timestamp (get-timestamp)
+        
+        ;; Retention settings
+        preserve-min (parse-preserve-min 
+                      (or snapshot-preserve-min 
+                          (:snapshot-preserve-min global-defaults)
+                          "all"))
+        preserve (parse-preserve 
+                  (or snapshot-preserve 
+                      (:snapshot-preserve global-defaults)
+                      "no"))
+        
+        hour-of-day (or (:preserve-hour-of-day vol-config)
+                       (:preserve-hour-of-day global-defaults)
+                       0)
+        day-of-week (or (:preserve-day-of-week vol-config)
+                       (:preserve-day-of-week global-defaults)
+                       :sunday)
+        
+        ;; Create new snapshot
+        new-snapshot (when-not dry-run?
+                      (create-snapshot source timestamp prefix))
+        
+        ;; Get all snapshots
+        all-snapshots (list-snapshots source)
+        managed (filter-managed-snapshots all-snapshots prefix)
+        
+        ;; Apply retention
+        {keep-local :keep destroy-local :destroy}
+        (apply-btrbk-retention managed prefix preserve-min preserve 
+                              hour-of-day day-of-week)]
+    
+    (println "\nVolume:" source)
+    (println "  snapshot_preserve_min:" (or snapshot-preserve-min 
+                                            (:snapshot-preserve-min global-defaults)
+                                            "all"))
+    (println "  snapshot_preserve:" (or snapshot-preserve 
+                                        (:snapshot-preserve global-defaults)
+                                        "no"))
+    (println "  Keeping" (count keep-local) "local snapshots")
+    (println "  Destroying" (count destroy-local) "local snapshots")
+    
+    ;; Destroy old snapshots
+    (doseq [snap destroy-local]
+      (if dry-run?
+        (println "  [DRY RUN] Would destroy:" snap)
+        (destroy-snapshot snap)))
+    
+    {:source source
+     :new-snapshot new-snapshot
+     :kept-snapshots keep-local
+     :prefix prefix
+     :hour-of-day hour-of-day
+     :day-of-week day-of-week}))
+
+;; === Target/Remote Management ===
+
+(defn find-common-snapshot [local-snapshots remote-snapshots prefix]
+  (let [local-set (set (map #(second (str/split % #"@")) local-snapshots))
+        remote-set (set (map #(second (str/split % #"@")) remote-snapshots))
+        common (filter local-set remote-set)]
+    (when (seq common)
+      (last (sort common)))))
+
+(defn process-target [target-config vol-result global-defaults dry-run?]
+  (let [{:keys [ssh target target-preserve target-preserve-min]} target-config
+        {:keys [source new-snapshot kept-snapshots prefix hour-of-day day-of-week]} vol-result
+        
+        ;; Retention settings for target
+        preserve-min (parse-preserve-min 
+                      (or target-preserve-min 
+                          (:target-preserve-min global-defaults)
+                          "all"))
+        preserve (parse-preserve 
+                  (or target-preserve 
+                      (:target-preserve global-defaults)
+                      "no"))
+        
+        target-hour (or (:preserve-hour-of-day target-config) hour-of-day)
+        target-day (or (:preserve-day-of-week target-config) day-of-week)
+        
+        ;; Get remote snapshots
+        remote-list-cmd (if ssh
+                         (str "ssh " ssh " zfs list -H -t snapshot -o name -r " target)
+                         (str "zfs list -H -t snapshot -o name -r " target))
+        remote-output (run-cmd-safe remote-list-cmd)
+        remote-snapshots (if remote-output (str/split-lines remote-output) [])
+        remote-managed (filter-managed-snapshots remote-snapshots prefix)
+        
+        ;; Find incremental base
+        common (find-common-snapshot kept-snapshots remote-managed prefix)
+        incremental-base (when common (str source "@" common))
+        
+        ;; Send new snapshot
+        _ (when (and new-snapshot (not dry-run?))
+            (try
+              (send-snapshot new-snapshot target ssh incremental-base)
+              (catch Exception e
+                (println "  Error sending snapshot:" (.getMessage e)))))
+        
+        ;; Apply retention on remote
+        {keep-remote :keep destroy-remote :destroy}
+        (apply-btrbk-retention remote-managed prefix preserve-min preserve 
+                              target-hour target-day)]
+    
+    (println "\n  Target:" (or ssh "local") target)
+    (println "    target_preserve_min:" (or target-preserve-min 
+                                            (:target-preserve-min global-defaults)
+                                            "all"))
+    (println "    target_preserve:" (or target-preserve 
+                                        (:target-preserve global-defaults)
+                                        "no"))
+    (println "    Keeping" (count keep-remote) "remote snapshots")
+    (println "    Destroying" (count destroy-remote) "remote snapshots")
+    (when incremental-base
+      (println "    Using incremental base:" incremental-base))
+    
+    ;; Destroy old remote snapshots
+    (doseq [snap destroy-remote]
+      (let [destroy-cmd (if ssh
+                         (str "ssh " ssh " zfs destroy " snap)
+                         (str "zfs destroy " snap))]
+        (if dry-run?
+          (println "    [DRY RUN] Would destroy:" snap)
+          (do
+            (println "    Destroying remote snapshot:" snap)
+            (run-cmd destroy-cmd)))))))
+
+;; === Main Processing ===
+
+(defn process-config [config dry-run?]
+  (let [{:keys [global volumes]} config
+        defaults (or global {})]
+    
+    (println "=== ztrbk - ZFS Snapshot Manager ===")
+    (when dry-run? (println "\n*** DRY RUN MODE ***\n"))
+    
+    (doseq [vol-config volumes]
+      (try
+        (let [vol-result (process-volume vol-config defaults dry-run?)
+              targets (:targets vol-config)]
+          
+          ;; Process targets/remotes
+          (doseq [target targets]
+            (try
+              (process-target target vol-result defaults dry-run?)
+              (catch Exception e
+                (println "  Error processing target:" (.getMessage e))))))
+        
+        (catch Exception e
+          (println "Error processing volume:" (.getMessage e)))))))
+
+;; === CLI ===
+
+(defn print-usage []
+  (println "Usage: ztrbk [options] <command>")
+  (println "")
+  (println "Commands:")
+  (println "  run        Execute snapshot creation and replication")
+  (println "  dryrun     Show what would be done without making changes")
+  (println "")
+  (println "Options:")
+  (println "  -c, --config FILE    Use specified config file (default: /etc/ztrbk.conf)")
+  (println "")
+  (println "Example config file (EDN format):")
+  (println "")
+  (println "btrbk-style retention:")
+  (println "{:global {:snapshot-name \"ztrbk_\"")
+  (println "          :preserve-hour-of-day 0")
+  (println "          :preserve-day-of-week :sunday")
+  (println "          :snapshot-preserve-min \"all\"")
+  (println "          :snapshot-preserve \"no\"")
+  (println "          :target-preserve-min \"all\"")
+  (println "          :target-preserve \"no\"}")
+  (println " :volumes")
+  (println " [{:source \"tank/data\"")
+  (println "   :snapshot-preserve-min \"14d\"")
+  (println "   :snapshot-preserve \"14d 8w 24m\"")
+  (println "   :targets")
+  (println "   [{:target \"backup/data\"")
+  (println "     :ssh \"user@backup-host\"")
+  (println "     :target-preserve-min \"30d\"")
+  (println "     :target-preserve \"60d *m 10y\"}]}]}")
+  (println "")
+  (println "Preserve min values: all, latest, no, or <number>{h,d,w,m,y}")
+  (println "Preserve format: [<hourly>h] [<daily>d] [<weekly>w] [<monthly>m] [<yearly>y]")
+  (println "  Use * for 'all' (e.g., '*m' = keep all monthly backups)")
+  (println "")
+  (println "How it works:")
+  (println "  1. preserve_min: Keep ALL snapshots within this duration")
+  (println "  2. preserve: Keep specific snapshots (hourly/daily/weekly/monthly/yearly)")
+  (println "     - Snapshots within preserve_min are already kept")
+  (println "     - preserve adds ADDITIONAL snapshots beyond preserve_min")
+  (println "")
+  (println "Example: snapshot-preserve-min \"14d\" + snapshot-preserve \"60d 12m\"")
+  (println "  - Keep ALL snapshots from last 14 days (preserve_min)")
+  (println "  - Keep daily snapshots for 60 days")
+  (println "  - Keep monthly snapshots for 12 months")
+  (System/exit 1))
+
+(defn -main [& args]
+  (let [parsed (loop [args args
+                      config-path default-config-path
+                      command nil]
+                 (if-let [arg (first args)]
+                   (case arg
+                     ("-c" "--config") (recur (drop 2 args) (second args) command)
+                     ("run" "dryrun") (recur (rest args) config-path arg)
+                     (do
+                       (println "Unknown argument:" arg)
+                       (print-usage)))
+                   {:config-path config-path :command command}))]
+    
+    (when-not (:command parsed)
+      (print-usage))
+    
+    (let [config-path (:config-path parsed)
+          command (:command parsed)
+          dry-run? (= command "dryrun")]
+      
+      (when-not (.exists (io/file config-path))
+        (println "Config file not found:" config-path)
+        (System/exit 1))
+      
+      (try
+        (let [config (load-config config-path)]
+          (process-config config dry-run?))
+        (catch Exception e
+          (println "Error:" (.getMessage e))
+          (System/exit 1))))))
+
+(when (= *file* (System/getProperty "babashka.file"))
+  (apply -main *command-line-args*))
