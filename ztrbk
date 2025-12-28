@@ -310,11 +310,11 @@
   [snapshots prefix]
   (filter #(parse-snapshot-timestamp % prefix) snapshots))
 
-;; === Volume Configuration ===
+;; === Dataset Configuration ===
 
-(defn process-volume
-  [vol-config global-defaults dry-run?]
-  (let [{:keys [source prefix snapshot-preserve snapshot-preserve-min]} vol-config
+(defn process-dataset
+  [dataset-config global-defaults dry-run?]
+  (let [{:keys [source prefix snapshot-preserve snapshot-preserve-min]} dataset-config
         prefix (or prefix (:prefix global-defaults) "ztrbk_")
         timestamp
           (.format timestamp-formatter (or *now* (java.time.LocalDateTime/now)))
@@ -330,18 +330,18 @@
         preserve-min (normalize-preserve-min preserve-min-raw)
         preserve (normalize-preserve preserve-raw)
 
-        hour-of-day (or (:preserve-hour-of-day vol-config)
+        hour-of-day (or (:preserve-hour-of-day dataset-config)
                         (:preserve-hour-of-day global-defaults)
                         0)
         day-of-week (normalize-day-of-week
-                      (or (:preserve-day-of-week vol-config)
+                      (or (:preserve-day-of-week dataset-config)
                           (:preserve-day-of-week global-defaults)
                           :sunday))
-        week-of-month (or (:preserve-week-of-month vol-config)
+        week-of-month (or (:preserve-week-of-month dataset-config)
                           (:preserve-week-of-month global-defaults)
                           1)
         month-of-year (normalize-month-of-year
-                        (or (:preserve-month-of-year vol-config)
+                        (or (:preserve-month-of-year dataset-config)
                             (:preserve-month-of-year global-defaults)
                             :january))
 
@@ -364,7 +364,7 @@
                            week-of-month
                            month-of-year)]
 
-    (println "\nVolume:" source)
+    (println "\nDataset:" source)
     (println "  snapshot-preserve-min:" (format-preserve-min preserve-min-raw))
     (println "  snapshot-preserve:" (format-preserve preserve-raw))
     (println "  Keeping" (count keep-local) "local snapshots")
@@ -394,9 +394,9 @@
       (last (sort common)))))
 
 (defn process-target
-  [target-config vol-result global-defaults dry-run?]
+  [target-config dataset-result global-defaults dry-run?]
   (let [{:keys [target target-preserve target-preserve-min]} target-config
-        {:keys [source new-snapshot kept-snapshots prefix hour-of-day day-of-week]} vol-result
+        {:keys [source new-snapshot kept-snapshots prefix hour-of-day day-of-week]} dataset-result
 
         ;; Retention settings for target
         preserve-min-raw (or target-preserve-min
@@ -455,26 +455,26 @@
 
 (defn process-config
   [config dry-run?]
-  (let [{:keys [global volumes]} config
+  (let [{:keys [global datasets]} config
         defaults (or global {})]
 
     (println "=== ztrbk - ZFS Snapshot Manager ===")
     (when dry-run? (println "\n*** DRY RUN MODE ***\n"))
 
-    (doseq [vol-config volumes]
+    (doseq [dataset-config datasets]
       (try
-        (let [vol-result (process-volume vol-config defaults dry-run?)
-              targets (:targets vol-config)]
+        (let [dataset-result (process-dataset dataset-config defaults dry-run?)
+              targets (:targets dataset-config)]
 
           ;; Process targets
           (doseq [target targets]
             (try
-              (process-target target vol-result defaults dry-run?)
+              (process-target target dataset-result defaults dry-run?)
               (catch Exception e
                 (println "  Error processing target:" (.getMessage e))))))
 
         (catch Exception e
-          (println "Error processing volume:" (.getMessage e)))))))
+          (println "Error processing dataset:" (.getMessage e)))))))
 
 ;; === CLI ===
 
@@ -498,7 +498,7 @@
   (println "          :snapshot-preserve :no")
   (println "          :target-preserve-min :all")
   (println "          :target-preserve :no}")
-  (println " :volumes")
+  (println " :datasets")
   (println " [{:source \"tank/data\"")
   (println "   ;; Keep all for 14 days, then tiered")
   (println "   :snapshot-preserve-min {:days 14}")
