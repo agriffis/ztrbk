@@ -15,157 +15,97 @@
 
 ;; === ZFS Operations ===
 
-(defn run-cmd
-  [cmd]
-  (let [result (p/shell {:out :string :err :string :continue true} cmd)]
-    (when-not (zero? (:exit result))
-      (throw (ex-info "Command failed" {:cmd cmd :result result})))
-    (str/trim (:out result))))
+(def _snapshots (atom nil))
 
-(defn run-cmd-safe
-  [cmd]
-  (try
-    (run-cmd cmd)
-    (catch Exception e
-      nil)))
-
-(defn list-snapshots
+(defn fetch-snapshots
   [dataset]
-  (let [output (run-cmd-safe (str "zfs list -H -t snapshot -o name -r " dataset))]
-    (if output
-      (str/split-lines output)
-      [])))
+  (let [proc (p/shell {:out :string} "zfs list -H -t snapshot -o name -r" dataset)]
+    (->> (str/split-lines (:out proc))
+         (remove str/blank?)
+         set)))
+
+(defn snapshots
+  [dataset]
+  (or (get @_snapshots dataset)
+      (let [fetched (fetch-snapshots dataset)]
+        (swap! _snapshots assoc dataset fetched)
+        fetched)))
+
+(defn snapshot-dataset
+  [snapshot-name]
+  (first (str/split snapshot-name #"@")))
+
+(defn snapshot-rest
+  [snapshot-name]
+  (second (str/split snapshot-name #"@")))
 
 (defn snapshot-exists?
   [snapshot-name]
-  (zero? (:exit (p/shell {:continue true :out :string}
-                         (str "zfs list -H -t snapshot " snapshot-name)))))
+  (let [snaps (snapshots (snapshot-dataset snapshot-name))]
+    (boolean (snaps snapshot-name))))
 
 (defn create-snapshot
-  [dataset timestamp prefix]
+  "Create snapshot if it does not already exist"
+  [dataset prefix timestamp]
   (let [snapshot-name (str dataset "@" prefix timestamp)]
-    (println "Creating snapshot:" snapshot-name)
-    (run-cmd (str "zfs snapshot " snapshot-name))
+    (when (not (snapshot-exists? snapshot-name))
+      (p/shell "zfs snapshot" snapshot-name)
+      (swap! _snapshots update dataset conj snapshot-name))
     snapshot-name))
 
 (defn destroy-snapshot
+  "Destroy snapshot if it exists"
   [snapshot-name]
-  (println "Destroying snapshot:" snapshot-name)
-  (run-cmd (str "zfs destroy " snapshot-name)))
+  (when (snapshot-exists? snapshot-name)
+    (p/shell "zfs destroy" snapshot-name)
+    (let [dataset (snapshot-dataset snapshot-name)]
+      (swap! _snapshots update dataset disj snapshot-name))))
 
 (defn send-snapshot
-  ([snapshot-name remote-dataset ssh-host]
-   (send-snapshot snapshot-name remote-dataset ssh-host nil))
-  ([snapshot-name remote-dataset ssh-host incremental-base]
-   (let [dataset (first (str/split snapshot-name #"@"))
-         snapshot (second (str/split snapshot-name #"@"))
-         remote-snapshot (str remote-dataset "@" snapshot)
-
-         ;; Check if snapshot already exists on remote
-         check-cmd (if ssh-host
-                     (str "ssh " ssh-host " zfs list -H -t snapshot " remote-snapshot)
-                     (str "zfs list -H -t snapshot " remote-snapshot))
-         exists? (zero? (:exit (p/shell {:continue true :out :string} check-cmd)))]
-
-     (when exists?
-       (println "Snapshot already exists on remote:" remote-snapshot)
-       (throw (ex-info "Remote snapshot exists" {:snapshot remote-snapshot})))
-
-     (println "Sending snapshot:" snapshot-name "to" (or ssh-host "local") remote-dataset)
-
+  "Send snapshot to target dataset, optionally incrementally, if it does not
+  already exist"
+  ([snapshot-name target-dataset]
+   (send-snapshot snapshot-name target-dataset nil))
+  ([snapshot-name target-dataset incremental-base]
+   (when-not (snapshot-exists? (str target-dataset "@" (snapshot-rest snapshot-name)))
      (let [send-cmd (if incremental-base
-                      (str "zfs send -i " incremental-base " " snapshot-name)
-                      (str "zfs send " snapshot-name))
-           recv-cmd (if ssh-host
-                      (str "ssh " ssh-host " zfs receive -F " remote-dataset)
-                      (str "zfs receive -F " remote-dataset))
-           full-cmd (str send-cmd " | " recv-cmd)]
-       (run-cmd full-cmd)))))
+                      ["zfs send -w -i" incremental-base snapshot-name]
+                      ["zfs send -w" snapshot-name])
+           recv-cmd ["zfs receive -e" target-dataset]
+           send-proc (apply p/process {:err :inherit} send-cmd)
+           recv-proc (apply p/shell {:in (:out send-proc)} recv-cmd)]
+       recv-proc))))
 
 ;; === Timestamp Parsing ===
 
+;; TODO: make the timestamp format configurable, then use a dynamic
+(def timestamp-formatter
+  (java.time.format.DateTimeFormatter/ofPattern "yyyy-MM-dd_HH-mm"))
+
 (defn parse-timestamp
+  "Attempt to parse timestamp string, returning nil on failure"
   [ts-str]
   (try
-    (java.time.LocalDateTime/parse ts-str
-                                   (java.time.format.DateTimeFormatter/ofPattern "yyyyMMdd-HHmmss"))
-    (catch Exception e
-      nil)))
+   (java.time.LocalDateTime/parse ts-str timestamp-formatter)
+   (catch Exception _ nil)))
 
 (defn parse-snapshot-timestamp
+  "Attempt to parse timestamp from snapshot name with given prefix, returning
+  nil for no match"
   [snapshot-name prefix]
-  (when-let [snap-part (second (str/split snapshot-name #"@"))]
+  (when-let [snap-part (snapshot-rest snapshot-name)]
     (when (str/starts-with? snap-part prefix)
       (let [ts-str (subs snap-part (count prefix))]
         (parse-timestamp ts-str)))))
 
-;; === Retention Policy (Clojure-idiomatic) ===
+;; === Retention Policy ===
 
-(defn normalize-preserve-min
-  [spec]
-  "Normalize preserve_min to a standard format"
-  (cond
-    (= spec :all) {:type :all}
-    (= spec :latest) {:type :latest}
-    (= spec :no) {:type :no}
-    (keyword? spec) (throw (ex-info "Invalid preserve-min keyword" {:spec spec}))
-    (string? spec)
-      (when-let [match (re-matches #"(\d+)([hdwmy])" spec)]
-        (let [[_ amount unit-char] match
-              amount (Integer/parseInt amount)
-              unit (case unit-char
-                     "h" :hours
-                     "d" :days
-                     "w" :weeks
-                     "m" :months
-                     "y" :years)]
-          {:type :duration :amount amount :unit unit}))
-    (map? spec)
-      (let [amount (or (:hours spec)
-                       (:days spec)
-                       (:weeks spec)
-                       (:months spec)
-                       (:years spec))
-            unit (cond
-                   (:hours spec) :hours
-                   (:days spec) :days
-                   (:weeks spec) :weeks
-                   (:months spec) :months
-                   (:years spec) :years)]
-        (when (and amount unit)
-          {:type :duration :amount amount :unit unit}))
-    :else nil))
-
-(defn normalize-preserve
-  [spec]
-  "Normalize preserve spec to standard format"
-  (cond
-    (= spec :no) nil
-    (nil? spec) nil
-    (keyword? spec) (throw (ex-info "Invalid preserve keyword" {:spec spec}))
-    (map? spec)
-      (let [result {}
-            result (if-let [h (:hours spec)]
-                     (assoc result :hourly h)
-                     result)
-            result (if-let [d (:days spec)]
-                     (assoc result :daily d)
-                     result)
-            result (if-let [w (:weeks spec)]
-                     (assoc result :weekly w)
-                     result)
-            result (if-let [m (:months spec)]
-                     (assoc result :monthly m)
-                     result)
-            result (if-let [y (:years spec)]
-                     (assoc result :yearly y)
-                     result)]
-        result)
-    :else nil))
+(def ^:dynamic *now* nil)
 
 (defn time-ago
-  [duration-amount duration-unit]
-  (let [now (java.time.LocalDateTime/now)]
+  ([duration-amount duration-unit]
+   (time-ago duration-amount duration-unit (or *now* java.time.LocalDateTime/now)))
+  ([duration-amount duration-unit now]
     (case duration-unit
       :hours (.minusHours now duration-amount)
       :days (.minusDays now duration-amount)
@@ -173,49 +113,54 @@
       :months (.minusMonths now duration-amount)
       :years (.minusYears now duration-amount))))
 
-(defn get-period-key
-  [timestamp period hour-of-day day-of-week]
-  "Get a key that groups snapshots by their period"
-  (case period
-    :hourly [(.getYear timestamp) (.getDayOfYear timestamp) (.getHour timestamp)]
-    :daily [(.getYear timestamp) (.getDayOfYear timestamp)]
-    :weekly [(.getYear timestamp) (.. timestamp (get java.time.temporal.WeekFields/ISO weekOfWeekBasedYear))]
-    :monthly [(.getYear timestamp) (.getMonthValue timestamp)]
-    :yearly [(.getYear timestamp)]))
+(def units [:hours :days :weeks :months :years])
 
-(defn is-daily-backup?
-  [timestamp hour-of-day]
-  (>= (.getHour timestamp) hour-of-day))
+(defn is-valid-unit?
+  [unit-kw]
+  (some #{unit-kw} units))
 
-(defn is-weekly-backup?
-  [timestamp day-of-week]
-  (let [dow-map {:monday 1
-                 :tuesday 2
-                 :wednesday 3
-                 :thursday 4
-                 :friday 5
-                 :saturday 6
-                 :sunday 7}
-        target-dow (get dow-map day-of-week 7)
-        actual-dow (.getValue (.getDayOfWeek timestamp))]
-    (= actual-dow target-dow)))
+(defn normalize-preserve-min
+  "Normalize preserve-min to a standard format"
+  [spec]
+  (cond
+    (= spec :all) {:type :all}
+    (= spec :latest) {:type :latest}
+    (= spec :no) {:type :no}
+    (nil? spec) {:type :all}
+    (map? spec)
+      (do
+        (when (not= 1 (count spec))
+          (throw (ex-info "Invalid preserve-min count" {:spec spec})))
+        (let [[unit amount] (first spec)]
+          (when (not (is-valid-unit? unit))
+            (throw (ex-info "Invalid preserve-min unit" {:spec spec})))
+          {:type :duration :unit unit :amount amount}))
+    :else (throw (ex-info "Invalid preserve-min spec" {:spec spec}))))
 
-(defn within-preserve-min?
-  [snapshot-ts preserve-min-spec]
-  "Check if snapshot falls within preserve_min duration"
-  (case (:type preserve-min-spec)
-    :all true
-    :latest false  ;; handled separately
-    :no false
-    :duration
-      (let [{:keys [amount unit]} preserve-min-spec
-            cutoff-time (time-ago amount unit)]
-        (.isAfter snapshot-ts cutoff-time))))
+(defn normalize-preserve
+  "Normalize preserve spec to standard format"
+  [spec]
+  (cond
+    (= spec :no) nil
+    (nil? spec) nil
+    (map? spec) spec
+    :else (throw (ex-info "Invalid preserve spec" {:spec spec}))))
 
-(defn apply-btrbk-retention
-  [snapshots prefix preserve-min-spec preserve-spec
-   hour-of-day day-of-week]
+(defn expired?
+  "Check if snapshot falls within amount units"
+  [snapshot-ts amount unit]
+  (let [cutoff-time (time-ago amount unit)]
+    (.isAfter cutoff-time snapshot-ts)))
+
+;; preserve-hour-of-day: hour on which daily backups are taken, 0-23
+;; preserve-day-of-week: day on which weekly backups are taken, keyword or 0-7 where 0 and 7 are both sunday
+;; preserve-week-of-month: week in which monthly backups are taken, 1-based
+;; preserve-month-of-year: month in which yearly backups are taken, keyword or 1-based
+
+(defn apply-retention
   "Apply btrbk-style retention policy"
+  [snapshots prefix preserve-min-spec preserve-spec
+   hour-of-day day-of-week week-of-month month-of-year]
   (let [;; Parse snapshot timestamps
         snaps-with-ts (keep (fn [snap]
                               (when-let [ts (parse-snapshot-timestamp snap prefix)]
@@ -223,137 +168,68 @@
                             snapshots)
 
         ;; Sort by timestamp (newest first)
-        sorted-snaps (reverse (sort-by :timestamp snaps-with-ts))
+        snaps-with-ts (reverse (sort-by :timestamp snaps-with-ts))
 
-        ;; First, check preserve_min
-        preserved-by-min (if (= (:type preserve-min-spec) :all)
-                           (set (map :snapshot snaps-with-ts))
-                           (if (= (:type preserve-min-spec) :latest)
-                             #{(:snapshot (first sorted-snaps))}
-                             (set (map :snapshot
-                                    (filter #(within-preserve-min?
-                                               (:timestamp %)
-                                               preserve-min-spec)
-                                      snaps-with-ts)))))
+        ;; First, check preserve-min
+        preserved-by-min (case (:type preserve-min-spec)
+                           :all (set (map :snapshot snaps-with-ts))
+                           :latest #{(:snapshot (first snaps-with-ts))}
+                           :no #{}
+                           :duration (set (map :snapshot
+                                            (remove #(expired?
+                                                       (:timestamp %)
+                                                       (:amount preserve-min-spec)
+                                                       (:unit preserve-min-spec))
+                                              snaps-with-ts))))
 
         ;; Then apply preserve policy (if any)
         preserved-by-policy
           (if (or (nil? preserve-spec)
                   (= (:type preserve-min-spec) :all))
             #{}
-            (let [now (java.time.LocalDateTime/now)
-
-                  ;; Helper to find snapshots for a period
-                  find-for-period
-                    (fn [period keep-count]
-                      (when keep-count
-                        (let [candidates
-                                (case period
-                                  :hourly snaps-with-ts
-                                  :daily (filter #(is-daily-backup? (:timestamp %) hour-of-day)
-                                           snaps-with-ts)
-                                  :weekly (filter #(and (is-daily-backup? (:timestamp %) hour-of-day)
-                                                        (is-weekly-backup? (:timestamp %) day-of-week))
-                                            snaps-with-ts)
-                                  :monthly (filter #(and (is-daily-backup? (:timestamp %) hour-of-day)
-                                                         (is-weekly-backup? (:timestamp %) day-of-week))
-                                             snaps-with-ts)
-                                  :yearly (filter #(and (is-daily-backup? (:timestamp %) hour-of-day)
-                                                        (is-weekly-backup? (:timestamp %) day-of-week))
-                                            snaps-with-ts))
-
-                              grouped (group-by #(get-period-key (:timestamp %)
-                                                                 period
-                                                                 hour-of-day
-                                                                 day-of-week)
-                                                candidates)
-
-                              ;; Get newest from each period
-                              period-keepers (map (fn [[_ snaps]]
-                                                    (first (sort-by :timestamp #(compare %2 %1) snaps)))
-                                               grouped)
-
-                              ;; Sort by timestamp and take requested count
-                              sorted-keepers (reverse (sort-by :timestamp period-keepers))
-                              final (if (= keep-count :all)
-                                      sorted-keepers
-                                      (take keep-count sorted-keepers))]
-                          (set (map :snapshot final)))))
-
-                  hourly-preserved (find-for-period :hourly (:hourly preserve-spec))
-                  daily-preserved (find-for-period :daily (:daily preserve-spec))
-                  weekly-preserved (find-for-period :weekly (:weekly preserve-spec))
-                  monthly-preserved (find-for-period :monthly (:monthly preserve-spec))
-                  yearly-preserved (find-for-period :yearly (:yearly preserve-spec))]
-
-              (into #{}
-                    (concat hourly-preserved
-                            daily-preserved
-                            weekly-preserved
-                            monthly-preserved
-                            yearly-preserved))))
+            (let [;; Helper to find snapshots for a period
+                  find-for-unit
+                    (fn [unit]
+                      (let [amount (or (preserve-spec unit) 0)
+                            unexpired (if (= :all amount)
+                                        snaps-with-ts
+                                        (take-while #(not (expired? (:timestamp %)
+                                                                    amount
+                                                                    unit))
+                                                    snaps-with-ts))
+                            grouped (group-by #(get-period-key (:timestamp %)
+                                                               unit
+                                                               hour-of-day
+                                                               day-of-week
+                                                               week-of-month
+                                                               month-of-year)
+                                              unexpired)
+                            keepers (map (fn [[_ snaps]]
+                                           (first (sort-by :timestamp compare snaps)))
+                                      grouped)]
+                        (map :snapshot keepers)))]
+              (into #{} (mapcat find-for-unit units))))
 
         ;; Combine both sets
         all-preserved (into preserved-by-min preserved-by-policy)
         all-snapshot-names (set (map :snapshot snaps-with-ts))
         to-destroy (remove all-preserved all-snapshot-names)]
 
-    {:keep (vec all-preserved)
-     :destroy (vec to-destroy)}))
+    {:keep (vec (sort all-preserved))
+     :destroy (vec (sort to-destroy))}))
 
 (defn filter-managed-snapshots
   [snapshots prefix]
   (filter #(parse-snapshot-timestamp % prefix) snapshots))
 
-(defn get-timestamp
-  []
-  (let [now (java.time.LocalDateTime/now)]
-    (.format now (java.time.format.DateTimeFormatter/ofPattern "yyyyMMdd-HHmmss"))))
-
-(defn format-preserve-min
-  [spec]
-  "Format preserve-min for display"
-  (cond
-    (= spec :all) ":all"
-    (= spec :latest) ":latest"
-    (= spec :no) ":no"
-    (string? spec) spec
-    (map? spec)
-      (let [[unit amount] (first (filter second spec))]
-        (str amount (name unit)))
-    :else "unknown"))
-
-(defn format-preserve
-  [spec]
-  "Format preserve for display"
-  (cond
-    (= spec :no) ":no"
-    (nil? spec) ":no"
-    (map? spec)
-      (str/join " "
-                (keep (fn [[k v]]
-                        (when v
-                          (str (if (= v :all) "*" v)
-                               (case k
-                                 :hourly "h"
-                                 :daily "d"
-                                 :weekly "w"
-                                 :monthly "m"
-                                 :yearly "y"))))
-                      [[:hourly (:hours spec)]
-                       [:daily (:days spec)]
-                       [:weekly (:weeks spec)]
-                       [:monthly (:months spec)]
-                       [:yearly (:years spec)]]))
-    :else "unknown"))
-
 ;; === Volume Configuration ===
 
 (defn process-volume
   [vol-config global-defaults dry-run?]
-  (let [{:keys [source snapshot-name snapshot-preserve snapshot-preserve-min]} vol-config
-        prefix (or snapshot-name (:snapshot-name global-defaults) "ztrbk_")
-        timestamp (get-timestamp)
+  (let [{:keys [source prefix snapshot-preserve snapshot-preserve-min]} vol-config
+        prefix (or prefix (:prefix global-defaults) "ztrbk_")
+        timestamp
+          (.format timestamp-formatter (or *now* (java.time.LocalDateTime/now)))
 
         ;; Retention settings
         preserve-min-raw (or snapshot-preserve-min
@@ -369,26 +245,36 @@
         hour-of-day (or (:preserve-hour-of-day vol-config)
                         (:preserve-hour-of-day global-defaults)
                         0)
-        day-of-week (or (:preserve-day-of-week vol-config)
-                        (:preserve-day-of-week global-defaults)
-                        :sunday)
+        day-of-week (normalize-day-of-week
+                      (or (:preserve-day-of-week vol-config)
+                          (:preserve-day-of-week global-defaults)
+                          :sunday))
+        week-of-month (or (:preserve-week-of-month vol-config)
+                          (:preserve-week-of-month global-defaults)
+                          1)
+        month-of-year (normalize-month-of-year
+                        (or (:preserve-month-of-year vol-config)
+                            (:preserve-month-of-year global-defaults)
+                            :january))
 
         ;; Create new snapshot
         new-snapshot (when-not dry-run?
-                       (create-snapshot source timestamp prefix))
+                       (create-snapshot source prefix timestamp))
 
         ;; Get all snapshots
-        all-snapshots (list-snapshots source)
+        all-snapshots (snapshots source)
         managed (filter-managed-snapshots all-snapshots prefix)
 
         ;; Apply retention
         {keep-local :keep destroy-local :destroy}
-          (apply-btrbk-retention managed
-                                 prefix
-                                 preserve-min
-                                 preserve
-                                 hour-of-day
-                                 day-of-week)]
+          (apply-retention managed
+                           prefix
+                           preserve-min
+                           preserve
+                           hour-of-day
+                           day-of-week
+                           week-of-month
+                           month-of-year)]
 
     (println "\nVolume:" source)
     (println "  snapshot-preserve-min:" (format-preserve-min preserve-min-raw))
@@ -412,16 +298,16 @@
 ;; === Target/Remote Management ===
 
 (defn find-common-snapshot
-  [local-snapshots remote-snapshots prefix]
-  (let [local-set (set (map #(second (str/split % #"@")) local-snapshots))
-        remote-set (set (map #(second (str/split % #"@")) remote-snapshots))
-        common (filter local-set remote-set)]
+  [local-snapshots target-snapshots]
+  (let [local-set (set (map snapshot-rest local-snapshots))
+        target-set (set (map snapshot-rest target-snapshots))
+        common (filter local-set target-set)]
     (when (seq common)
       (last (sort common)))))
 
 (defn process-target
   [target-config vol-result global-defaults dry-run?]
-  (let [{:keys [ssh target target-preserve target-preserve-min]} target-config
+  (let [{:keys [target target-preserve target-preserve-min]} target-config
         {:keys [source new-snapshot kept-snapshots prefix hour-of-day day-of-week]} vol-result
 
         ;; Retention settings for target
@@ -438,52 +324,44 @@
         target-hour (or (:preserve-hour-of-day target-config) hour-of-day)
         target-day (or (:preserve-day-of-week target-config) day-of-week)
 
-        ;; Get remote snapshots
-        remote-list-cmd (if ssh
-                          (str "ssh " ssh " zfs list -H -t snapshot -o name -r " target)
-                          (str "zfs list -H -t snapshot -o name -r " target))
-        remote-output (run-cmd-safe remote-list-cmd)
-        remote-snapshots (if remote-output (str/split-lines remote-output) [])
-        remote-managed (filter-managed-snapshots remote-snapshots prefix)
+        ;; Get target snapshots
+        target-snapshots (snapshots target)
+        target-managed (filter-managed-snapshots target-snapshots prefix)
 
         ;; Find incremental base
-        common (find-common-snapshot kept-snapshots remote-managed prefix)
+        common (find-common-snapshot kept-snapshots target-managed)
         incremental-base (when common (str source "@" common))
 
         ;; Send new snapshot
+        ;; TODO: should this depend on retention policy?
         _ (when (and new-snapshot (not dry-run?))
             (try
-              (send-snapshot new-snapshot target ssh incremental-base)
+              (send-snapshot new-snapshot target incremental-base)
               (catch Exception e
                 (println "  Error sending snapshot:" (.getMessage e)))))
 
-        ;; Apply retention on remote
-        {keep-remote :keep destroy-remote :destroy}
-          (apply-btrbk-retention remote-managed
-                                 prefix
-                                 preserve-min
-                                 preserve
-                                 target-hour
-                                 target-day)]
+        ;; Apply retention on target
+        {keep-target :keep destroy-target :destroy}
+          (apply-retention target-managed
+                           prefix
+                           preserve-min
+                           preserve
+                           target-hour
+                           target-day)]
 
-    (println "\n  Target:" (or ssh "local") target)
+    (println "\n  Target:" target)
     (println "    target-preserve-min:" (format-preserve-min preserve-min-raw))
     (println "    target-preserve:" (format-preserve preserve-raw))
-    (println "    Keeping" (count keep-remote) "remote snapshots")
-    (println "    Destroying" (count destroy-remote) "remote snapshots")
+    (println "    Keeping" (count keep-target) "target snapshots")
+    (println "    Destroying" (count destroy-target) "target snapshots")
     (when incremental-base
       (println "    Using incremental base:" incremental-base))
 
-    ;; Destroy old remote snapshots
-    (doseq [snap destroy-remote]
-      (let [destroy-cmd (if ssh
-                          (str "ssh " ssh " zfs destroy " snap)
-                          (str "zfs destroy " snap))]
-        (if dry-run?
-          (println "    [DRY RUN] Would destroy:" snap)
-          (do
-            (println "    Destroying remote snapshot:" snap)
-            (run-cmd destroy-cmd)))))))
+    ;; Destroy old target snapshots
+    (doseq [snap destroy-target]
+      (if dry-run?
+        (println "    [DRY RUN] Would destroy:" snap)
+        (destroy-snapshot snap)))))
 
 ;; === Main Processing ===
 
@@ -500,7 +378,7 @@
         (let [vol-result (process-volume vol-config defaults dry-run?)
               targets (:targets vol-config)]
 
-          ;; Process targets/remotes
+          ;; Process targets
           (doseq [target targets]
             (try
               (process-target target vol-result defaults dry-run?)
@@ -525,8 +403,7 @@
   (println "")
   (println "Example config file (EDN format):")
   (println "")
-  (println "Clojure-idiomatic retention (using maps):")
-  (println "{:global {:snapshot-name \"ztrbk_\"")
+  (println "{:global {:prefix \"ztrbk_\"")
   (println "          :preserve-hour-of-day 0")
   (println "          :preserve-day-of-week :sunday")
   (println "          :snapshot-preserve-min :all")
@@ -540,7 +417,6 @@
   (println "   :snapshot-preserve {:days 14 :weeks 8 :months 24}")
   (println "   :targets")
   (println "   [{:target \"backup/data\"")
-  (println "     :ssh \"user@backup-host\"")
   (println "     :target-preserve-min {:days 30}")
   (println "     :target-preserve {:days 60 :months :all :years 10}}]}")
   (println "")
@@ -552,9 +428,6 @@
   (println "              :target-preserve-min :latest")
   (println "              :target-preserve :no}]}]}")
   (println "")
-  (println "String format also supported:")
-  (println "  :snapshot-preserve-min \"14d\"")
-  (println "")
   (println "Preserve min values:")
   (println "  :all               - Keep everything forever (default)")
   (println "  :latest            - Keep only newest snapshot")
@@ -564,7 +437,6 @@
   (println "  {:weeks N}         - Keep all for N weeks")
   (println "  {:months N}        - Keep all for N months")
   (println "  {:years N}         - Keep all for N years")
-  (println "  \"<N>h/d/w/m/y\"     - String format (e.g., \"14d\", \"6w\")")
   (println "")
   (println "Preserve format (map with any combination):")
   (println "  {:hours N}         - Keep N hourly snapshots")
