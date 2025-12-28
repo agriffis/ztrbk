@@ -78,16 +78,20 @@
 
 ;; === Timestamp Parsing ===
 
-;; TODO: make the timestamp format configurable, then use a dynamic
+;; TODO: add configuration item for this
+(def ^:dynamic *timestamp-format-str* "yyyy-MM-dd_HH-mm")
+
 (def timestamp-formatter
-  (java.time.format.DateTimeFormatter/ofPattern "yyyy-MM-dd_HH-mm"))
+  (memoize (fn [format-str]
+              (java.time.format.DateTimeFormatter/ofPattern format-str))))
 
 (defn parse-timestamp
   "Attempt to parse timestamp string, returning nil on failure"
   [ts-str]
   (try
-   (java.time.LocalDateTime/parse ts-str timestamp-formatter)
-   (catch Exception _ nil)))
+    (java.time.LocalDateTime/parse ts-str (timestamp-formatter *timestamp-format-str*))
+    (catch Exception _
+      nil)))
 
 (defn parse-snapshot-timestamp
   "Attempt to parse timestamp from snapshot name with given prefix, returning
@@ -100,18 +104,19 @@
 
 ;; === Retention Policy ===
 
+;; TODO: set this at start of processing
 (def ^:dynamic *now* nil)
 
 (defn time-ago
   ([duration-amount duration-unit]
    (time-ago duration-amount duration-unit (or *now* java.time.LocalDateTime/now)))
   ([duration-amount duration-unit now]
-    (case duration-unit
-      :hours (.minusHours now duration-amount)
-      :days (.minusDays now duration-amount)
-      :weeks (.minusWeeks now duration-amount)
-      :months (.minusMonths now duration-amount)
-      :years (.minusYears now duration-amount))))
+   (case duration-unit
+     :hours (.minusHours now duration-amount)
+     :days (.minusDays now duration-amount)
+     :weeks (.minusWeeks now duration-amount)
+     :months (.minusMonths now duration-amount)
+     :years (.minusYears now duration-amount))))
 
 (def units [:hours :days :weeks :months :years])
 
@@ -152,10 +157,93 @@
   (let [cutoff-time (time-ago amount unit)]
     (.isAfter cutoff-time snapshot-ts)))
 
+(defn normalize-day-of-week
+  "Normalize day-of-week to integer 1-7 (Monday=1, Sunday=7)"
+  [spec]
+  (cond
+    (int? spec) (cond
+                  (= spec 0) 7  ; 0 -> Sunday
+                  (= spec 7) 7  ; 7 -> Sunday
+                  (<= 1 spec 6) spec
+                  :else (throw (ex-info "Invalid day-of-week number" {:spec spec})))
+    (keyword? spec) (case spec
+                      :monday 1
+                      :tuesday 2
+                      :wednesday 3
+                      :thursday 4
+                      :friday 5
+                      :saturday 6
+                      :sunday 7
+                      (throw (ex-info "Invalid day-of-week keyword" {:spec spec})))
+    :else (throw (ex-info "Invalid day-of-week spec" {:spec spec}))))
+
+(defn normalize-month-of-year
+  "Normalize month-of-year to integer 1-12"
+  [spec]
+  (cond
+    (int? spec) (if (<= 1 spec 12)
+                  spec
+                  (throw (ex-info "Invalid month-of-year number" {:spec spec})))
+    (keyword? spec) (case spec
+                      :january 1
+                      :february 2
+                      :march 3
+                      :april 4
+                      :may 5
+                      :june 6
+                      :july 7
+                      :august 8
+                      :september 9
+                      :october 10
+                      :november 11
+                      :december 12
+                      (throw (ex-info "Invalid month-of-year keyword" {:spec spec})))
+    :else (throw (ex-info "Invalid month-of-year spec" {:spec spec}))))
+
 ;; preserve-hour-of-day: hour on which daily backups are taken, 0-23
 ;; preserve-day-of-week: day on which weekly backups are taken, keyword or 0-7 where 0 and 7 are both sunday
 ;; preserve-week-of-month: week in which monthly backups are taken, 1-based
 ;; preserve-month-of-year: month in which yearly backups are taken, keyword or 1-based
+
+(defn get-period-key
+  "Get a key for grouping snapshots by period"
+  [timestamp unit hour-of-day day-of-week week-of-month month-of-year]
+  (let [;; Adjust timestamp so day starts at hour-of-day (for all units except :hours)
+        adjusted (if (and (not= unit :hours)
+                          (< (.getHour timestamp) hour-of-day))
+                   (.minusDays timestamp 1)
+                   timestamp)
+        ;; Further adjust so month starts at week-of-month (for :months and :years)
+        adjusted (if (and (or (= unit :months) (= unit :years))
+                          (< (int (Math/ceil (/ (.getDayOfMonth adjusted) 7.0))) week-of-month))
+                   (.minusMonths adjusted 1)
+                   adjusted)
+        ;; Further adjust so year starts at month-of-year (for :years only)
+        adjusted (if (and (= unit :years)
+                          (< (.getMonthValue adjusted) month-of-year))
+                   (.minusYears adjusted 1)
+                   adjusted)]
+    (case unit
+      :hours [(.getYear timestamp)
+              (.getMonthValue timestamp)
+              (.getDayOfMonth timestamp)
+              (.getHour timestamp)]
+      :days [(.getYear adjusted)
+             (.getMonthValue adjusted)
+             (.getDayOfMonth adjusted)]
+      :weeks (let [ts-day-of-week (.getValue (.getDayOfWeek adjusted))
+                   ;; Calculate days to subtract to get to the target day
+                   days-back (mod (+ (- ts-day-of-week day-of-week) 7) 7)
+                   week-start (.minusDays adjusted days-back)]
+               [(.getYear week-start)
+                (.getMonthValue week-start)
+                (.getDayOfMonth week-start)])
+      :months (let [day-of-month (.getDayOfMonth adjusted)
+                    week (int (Math/ceil (/ day-of-month 7.0)))]
+                [(.getYear adjusted)
+                 (.getMonthValue adjusted)
+                 week])
+      :years [(.getYear adjusted)])))
 
 (defn apply-retention
   "Apply btrbk-style retention policy"
