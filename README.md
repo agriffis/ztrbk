@@ -63,7 +63,8 @@ Create `/etc/ztrbk.edn` with your backup policy:
 
 ```clojure
 {:global
- {:prefix "ztrbk_"
+ {;; These are the global defaults
+  :prefix "ztrbk_"
   :preserve-hour-of-day 0
   :preserve-day-of-week :sunday
   :preserve-week-of-month 1
@@ -74,17 +75,7 @@ Create `/etc/ztrbk.edn` with your backup policy:
   :target-preserve :no}
 
  :datasets
- [{:source "tank/data"
-   ;; Keep all snapshots for 14 days, then tiered retention
-   :snapshot-preserve-min {:days 14}
-   :snapshot-preserve {:days 14 :weeks 8 :months 24}
-   :targets
-   [{:target "backup/data"
-     ;; Keep all for 30 days, then more aggressive retention on backup
-     :target-preserve-min {:days 30}
-     :target-preserve {:days 60 :months :all :years 10}}]}
-
-  ;; Simple example: only keep latest snapshot
+ [;; Simple example: only keep latest snapshot
   {:source "tank/temp"
    :snapshot-preserve-min :latest
    :snapshot-preserve :no
@@ -92,13 +83,16 @@ Create `/etc/ztrbk.edn` with your backup policy:
               :target-preserve-min :latest
               :target-preserve :no}]}
 
-  ;; Example: aggressive local retention, longer-term on backup
-  {:source "tank/documents"
-   :snapshot-preserve-min {:days 7}
-   :snapshot-preserve {:days 7 :weeks 4 :months 12}
-   :targets [{:target "backup/documents"
-              :target-preserve-min {:months 3}
-              :target-preserve {:months 12 :years :all}}]}]}
+  ;; Better example: tiered retention locally and on backup
+  {:source "tank/data"
+   ;; Keep all snapshots for 14 days, then tiered retention
+   :snapshot-preserve-min {:days 14}
+   :snapshot-preserve {:days 14 :weeks 8 :months 24}
+   :targets
+   [{:target "backup/data"
+     ;; Keep all for 30 days, then extended tiers on backup
+     :target-preserve-min {:days 30}
+     :target-preserve {:days 60 :months 14 :years :all}}]}
 ```
 
 ### Configuration Options
@@ -154,29 +148,11 @@ While ztrbk is inspired by btrbk's approach to snapshot management, there are se
 | **Config format** | Custom text | EDN (Clojure data) |
 | **Remote backups** | SSH push/pull | Local targets only (currently) |
 | **Scheduling** | External (cron) | External (cron) |
-| **Raw backups** | Supported | Not implemented |
 | **Archive mode** | Supported | Not implemented |
 | **Resume support** | Yes | No |
 | **Lockfiles** | Yes | No |
 | **Rate limiting** | Yes | No |
 | **Transaction log** | Optional | No |
-| **Stream compression** | Supported | Uses ZFS native (`-w` flag) |
-
-### Simplified Features
-
-ztrbk intentionally simplifies some aspects:
-- **No SSH support yet**: Currently only supports local targets (but ZFS send/receive can be piped through SSH manually)
-- **No subvolume handling**: Works with ZFS datasets, not Btrfs subvolumes
-- **Simpler config**: EDN format is more structured but requires learning Clojure syntax
-- **No transaction log**: Operations are not logged to a transaction file
-- **No lockfile management**: Single execution assumed (use external locking if needed)
-
-### Extended Features
-
-Some areas where ztrbk differs:
-- **EDN configuration**: Native Clojure data structures allow for more programmatic configuration
-- **Babashka runtime**: Fast startup time, no compilation needed
-- **ZFS-specific**: Takes advantage of ZFS features like raw encrypted sends (`-w`)
 
 ## Credit and Inspiration
 
