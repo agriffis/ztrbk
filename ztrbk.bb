@@ -61,10 +61,12 @@
 
 (defn create-snapshot
   "Create snapshot if it does not already exist"
-  [dataset prefix timestamp]
+  [dataset prefix timestamp recursive]
   (let [snapshot-name (str dataset "@" prefix timestamp)]
     (when (not (snapshot-exists? snapshot-name))
-      (let [cmd ["zfs snapshot" snapshot-name]]
+      (let [cmd (if recursive
+                  ["zfs snapshot -r" snapshot-name]
+                  ["zfs snapshot" snapshot-name])]
         (println (if *dry-run* "[DRY RUN]" "[RUN]") cmd)
         (when-not *dry-run*
           (apply p/shell cmd)))
@@ -392,6 +394,7 @@
   [dataset-config global-defaults]
   (let [{:keys [source prefix]} dataset-config
         prefix (or prefix (:prefix global-defaults) "ztrbk_")
+        recursive (get (merge global-defaults dataset-config) :recursive true)
         timestamp
           (.format timestamp-formatter (or *now* (java.time.LocalDateTime/now)))
 
@@ -404,7 +407,7 @@
                                       :snapshot-preserve)
 
         ;; Create new snapshot
-        new-snapshot (create-snapshot source prefix timestamp)
+        new-snapshot (create-snapshot source prefix timestamp recursive)
 
         ;; Get all snapshots
         all-snapshots (list-snapshots source)
@@ -586,6 +589,7 @@
   (println "")
   (println "Global and per-dataset/target configuration:")
   (println "  :prefix                    - Snapshot name prefix (default: \"ztrbk_\")")
+  (println "  :recursive                 - Create snapshots recursively (default: true)")
   (println "  :preserve-hour-of-day      - Hour when day starts (0-23, default: 0)")
   (println "  :preserve-day-of-week      - Day for weekly snapshots (:sunday-:saturday, or 0-7, default: :sunday)")
   (println "  :preserve-week-of-month    - Week for monthly snapshots (1-4, default: 1)")

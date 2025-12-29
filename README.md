@@ -101,6 +101,7 @@ Create `/etc/ztrbk.edn` with your backup policy:
 
 **Global and per-dataset/target options:**
 - `:prefix` - Snapshot name prefix (default: `"ztrbk_"`)
+- `:recursive` - Create snapshots recursively (default: `true`)
 - `:preserve-hour-of-day` - Hour when day starts, 0-23 (default: `0`)
 - `:preserve-day-of-week` - Day for weekly snapshots: `:sunday` through `:saturday`, or 0-7 (default: `:sunday`)
 - `:preserve-week-of-month` - Week for monthly snapshots, 1-4 (default: `1`)
