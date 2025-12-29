@@ -19,7 +19,7 @@
 
 ;; === Configuration ===
 
-(def default-config-path "/etc/ztrbk.conf")
+(def default-config-path "/etc/ztrbk.edn")
 
 (defn load-config
   [path]
