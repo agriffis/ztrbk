@@ -19,7 +19,7 @@ Key features:
 1. **Install Babashka** (if not already installed):
    ```bash
    # macOS
-   brew install bbedit/babashka/babashka
+   brew install borkdude/brew/babashka
 
    # Linux
    bash <(curl -s https://raw.githubusercontent.com/babashka/babashka/master/install)
