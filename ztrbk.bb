@@ -68,7 +68,7 @@
       (let [cmd (if recursive
                   ["zfs snapshot -r" snapshot-name]
                   ["zfs snapshot" snapshot-name])]
-        (println (if *dry-run* "[DRY RUN]" "[RUN]") cmd)
+        (apply println (if *dry-run* "[DRY RUN]" "[RUN]") cmd)
         (when-not *dry-run*
           (apply p/shell cmd)))
       (swap! _snapshots update dataset conj snapshot-name)
@@ -79,7 +79,7 @@
   [snapshot-name]
   (when (snapshot-exists? snapshot-name)
     (let [cmd ["zfs destroy" snapshot-name]]
-      (println (if (or *dry-run* *safe*) "[DRY RUN]" "[RUN]") cmd)
+      (apply println (if (or *dry-run* *safe*) "[DRY RUN]" "[RUN]") cmd)
       (when-not (or *dry-run* *safe*)
         (apply p/shell cmd)))
     (let [dataset (snapshot-dataset snapshot-name)]
@@ -97,7 +97,7 @@
                         ["zfs send -w -i" incremental-base snapshot-name]
                         ["zfs send -w" snapshot-name])
              recv-cmd ["zfs receive -e" target-dataset]
-             _ (println (if *dry-run* "[DRY RUN]" "[RUN]") send-cmd "|" recv-cmd)
+             _ (apply println (if *dry-run* "[DRY RUN]" "[RUN]") send-cmd "|" recv-cmd)
              proc (when-not *dry-run*
                     (p/pipeline (as-> (apply p/process {:err :inherit} send-cmd) prev
                                   (apply p/shell prev recv-cmd))))]
@@ -434,6 +434,7 @@
     (println "  snapshot-preserve:" (format-preserve preserve-raw))
     (println "  Keeping" (count keep-local) "local snapshots")
     (println "  Destroying" (count destroy-local) "local snapshots")
+    (println)
 
     ;; Destroy old snapshots
     (doseq [snap destroy-local]
@@ -519,6 +520,7 @@
       (println "    Skipped send: new snapshot would be immediately removed")
       (when incremental-base
         (println "    Used incremental base:" incremental-base)))
+    (println)
 
     ;; Destroy old target snapshots
     (doseq [snap destroy-target]
@@ -531,9 +533,7 @@
   (let [{:keys [global datasets]} config
         defaults (or global {})]
 
-    (println "=== ztrbk - ZFS snapshot manager ===")
-    (when *dry-run* (println "\n*** DRY RUN MODE ***\n"))
-    (when *safe* (println "\n*** SAFE MODE ***\n"))
+    (println "=== ztrbk - ZFS snapshot manager ===\n")
 
     (doseq [dataset-config datasets]
       (try
