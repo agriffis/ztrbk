@@ -1,4 +1,16 @@
 #!/usr/bin/env bb
+;;
+;; ztrbk - ZFS snapshot manager in the spirit of btrbk
+;;
+;; Written in 2025 by Aron Griffis <aron@arongriffis.com>
+;;
+;; To the extent possible under law, the author(s) have dedicated all copyright
+;; and related and neighboring rights to this software to the public domain
+;; worldwide. This software is distributed without any warranty.
+;;
+;; CC0 Public Domain Dedication at
+;; http://creativecommons.org/publicdomain/zero/1.0/
+;;======================================================================
 
 (require '[clojure.edn :as edn]
          '[clojure.string :as str]
@@ -234,11 +246,6 @@
                       :december 12
                       (throw (ex-info "Invalid month-of-year keyword" {:spec spec})))
     :else (throw (ex-info "Invalid month-of-year spec" {:spec spec}))))
-
-;; preserve-hour-of-day: hour on which daily backups are taken, 0-23
-;; preserve-day-of-week: day on which weekly backups are taken, keyword or 0-7 where 0 and 7 are both sunday
-;; preserve-week-of-month: week in which monthly backups are taken, 1-based
-;; preserve-month-of-year: month in which yearly backups are taken, keyword or 1-based
 
 (defn get-period-key
   "Get a key for grouping snapshots by period"
@@ -515,7 +522,7 @@
   (let [{:keys [global datasets]} config
         defaults (or global {})]
 
-    (println "=== ztrbk - ZFS Snapshot Manager ===")
+    (println "=== ztrbk - ZFS snapshot manager ===")
     (when *dry-run* (println "\n*** DRY RUN MODE ***\n"))
 
     (doseq [dataset-config datasets]
