@@ -13,6 +13,8 @@
   [path]
   (edn/read-string (slurp path)))
 
+(def ^:dynamic *dry-run* false)
+
 ;; === ZFS Operations ===
 
 (def _snapshots (atom nil))
@@ -49,15 +51,21 @@
   [dataset prefix timestamp]
   (let [snapshot-name (str dataset "@" prefix timestamp)]
     (when (not (snapshot-exists? snapshot-name))
-      (p/shell "zfs snapshot" snapshot-name)
-      (swap! _snapshots update dataset conj snapshot-name))
-    snapshot-name))
+      (let [cmd ["zfs snapshot" snapshot-name]]
+        (println (if *dry-run* "[DRY RUN]" "[RUN]") cmd)
+        (when-not *dry-run*
+          (apply p/shell cmd)))
+      (swap! _snapshots update dataset conj snapshot-name)
+      snapshot-name)))
 
 (defn destroy-snapshot
   "Destroy snapshot if it exists"
   [snapshot-name]
   (when (snapshot-exists? snapshot-name)
-    (p/shell "zfs destroy" snapshot-name)
+    (let [cmd ["zfs destroy" snapshot-name]]
+      (println (if *dry-run* "[DRY RUN]" "[RUN]") cmd)
+      (when-not *dry-run*
+        (apply p/shell cmd)))
     (let [dataset (snapshot-dataset snapshot-name)]
       (swap! _snapshots update dataset disj snapshot-name))))
 
@@ -67,23 +75,26 @@
   ([snapshot-name target-dataset]
    (send-snapshot snapshot-name target-dataset nil))
   ([snapshot-name target-dataset incremental-base]
-   (when-not (snapshot-exists? (str target-dataset "@" (snapshot-rest snapshot-name)))
-     (let [send-cmd (if incremental-base
-                      ["zfs send -w -i" incremental-base snapshot-name]
-                      ["zfs send -w" snapshot-name])
-           recv-cmd ["zfs receive -e" target-dataset]
-           send-proc (apply p/process {:err :inherit} send-cmd)
-           recv-proc (apply p/shell {:in (:out send-proc)} recv-cmd)]
-       recv-proc))))
+   (let [target-snapshot (str target-dataset "@" (snapshot-rest snapshot-name))]
+     (when-not (snapshot-exists? target-snapshot)
+       (let [send-cmd (if incremental-base
+                        ["zfs send -w -i" incremental-base snapshot-name]
+                        ["zfs send -w" snapshot-name])
+             recv-cmd ["zfs receive -e" target-dataset]
+             _ (println (if *dry-run* "[DRY RUN]" "[RUN]") send-cmd "|" recv-cmd)
+             proc (when-not *dry-run*
+                    (p/pipeline (as-> (apply p/process {:err :inherit} send-cmd) prev
+                                  (apply p/shell prev recv-cmd))))]
+         (swap! _snapshots update target-dataset conj target-snapshot)
+         proc)))))
 
 ;; === Timestamp Parsing ===
 
-;; TODO: add configuration item for this
 (def ^:dynamic *timestamp-format-str* "yyyy-MM-dd_HH-mm")
 
 (def timestamp-formatter
   (memoize (fn [format-str]
-              (java.time.format.DateTimeFormatter/ofPattern format-str))))
+             (java.time.format.DateTimeFormatter/ofPattern format-str))))
 
 (defn parse-timestamp
   "Attempt to parse timestamp string, returning nil on failure"
@@ -104,7 +115,6 @@
 
 ;; === Retention Policy ===
 
-;; TODO: set this at start of processing
 (def ^:dynamic *now* nil)
 
 (defn time-ago
@@ -150,6 +160,31 @@
     (nil? spec) nil
     (map? spec) spec
     :else (throw (ex-info "Invalid preserve spec" {:spec spec}))))
+
+(defn format-preserve-min
+  "Format preserve-min spec for display"
+  [spec]
+  (cond
+    (= spec :all) "all"
+    (= spec :latest) "latest"
+    (= spec :no) "no"
+    (nil? spec) "all"
+    (map? spec) (let [[unit amount] (first spec)]
+                  (str amount " " (name unit)))
+    :else (str spec)))
+
+(defn format-preserve
+  "Format preserve spec for display"
+  [spec]
+  (cond
+    (= spec :no) "no"
+    (nil? spec) "no"
+    (map? spec) (->> units
+                     (keep (fn [unit]
+                             (when-let [amount (get spec unit)]
+                               (str amount " " (name unit)))))
+                     (str/join ", "))
+    :else (str spec)))
 
 (defn expired?
   "Check if snapshot falls within amount units"
@@ -312,42 +347,56 @@
 
 ;; === Dataset Configuration ===
 
+(defn compute-retention-settings
+  [config global-defaults preserve-min-key preserve-key]
+  (let [preserve-min-raw (or (get config preserve-min-key)
+                             (get global-defaults preserve-min-key)
+                             :all)
+        preserve-raw (or (get config preserve-key)
+                         (get global-defaults preserve-key)
+                         :no)
+        preserve-min (normalize-preserve-min preserve-min-raw)
+        preserve (normalize-preserve preserve-raw)
+        hour-of-day (or (:preserve-hour-of-day config)
+                        (:preserve-hour-of-day global-defaults)
+                        0)
+        day-of-week (normalize-day-of-week
+                      (or (:preserve-day-of-week config)
+                          (:preserve-day-of-week global-defaults)
+                          :sunday))
+        week-of-month (or (:preserve-week-of-month config)
+                          (:preserve-week-of-month global-defaults)
+                          1)
+        month-of-year (normalize-month-of-year
+                        (or (:preserve-month-of-year config)
+                            (:preserve-month-of-year global-defaults)
+                            :january))]
+    {:preserve-min-raw preserve-min-raw
+     :preserve-raw preserve-raw
+     :preserve-min preserve-min
+     :preserve preserve
+     :hour-of-day hour-of-day
+     :day-of-week day-of-week
+     :week-of-month week-of-month
+     :month-of-year month-of-year}))
+
 (defn process-dataset
-  [dataset-config global-defaults dry-run?]
-  (let [{:keys [source prefix snapshot-preserve snapshot-preserve-min]} dataset-config
+  [dataset-config global-defaults]
+  (let [{:keys [source prefix]} dataset-config
         prefix (or prefix (:prefix global-defaults) "ztrbk_")
         timestamp
           (.format timestamp-formatter (or *now* (java.time.LocalDateTime/now)))
 
         ;; Retention settings
-        preserve-min-raw (or snapshot-preserve-min
-                             (:snapshot-preserve-min global-defaults)
-                             :all)
-        preserve-raw (or snapshot-preserve
-                         (:snapshot-preserve global-defaults)
-                         :no)
-
-        preserve-min (normalize-preserve-min preserve-min-raw)
-        preserve (normalize-preserve preserve-raw)
-
-        hour-of-day (or (:preserve-hour-of-day dataset-config)
-                        (:preserve-hour-of-day global-defaults)
-                        0)
-        day-of-week (normalize-day-of-week
-                      (or (:preserve-day-of-week dataset-config)
-                          (:preserve-day-of-week global-defaults)
-                          :sunday))
-        week-of-month (or (:preserve-week-of-month dataset-config)
-                          (:preserve-week-of-month global-defaults)
-                          1)
-        month-of-year (normalize-month-of-year
-                        (or (:preserve-month-of-year dataset-config)
-                            (:preserve-month-of-year global-defaults)
-                            :january))
+        {:keys [preserve-min-raw preserve-raw preserve-min preserve
+                hour-of-day day-of-week week-of-month month-of-year]}
+          (compute-retention-settings dataset-config
+                                      global-defaults
+                                      :snapshot-preserve-min
+                                      :snapshot-preserve)
 
         ;; Create new snapshot
-        new-snapshot (when-not dry-run?
-                       (create-snapshot source prefix timestamp))
+        new-snapshot (create-snapshot source prefix timestamp)
 
         ;; Get all snapshots
         all-snapshots (snapshots source)
@@ -372,9 +421,7 @@
 
     ;; Destroy old snapshots
     (doseq [snap destroy-local]
-      (if dry-run?
-        (println "  [DRY RUN] Would destroy:" snap)
-        (destroy-snapshot snap)))
+      (destroy-snapshot snap))
 
     {:source source
      :new-snapshot new-snapshot
@@ -394,23 +441,17 @@
       (last (sort common)))))
 
 (defn process-target
-  [target-config dataset-result global-defaults dry-run?]
-  (let [{:keys [target target-preserve target-preserve-min]} target-config
-        {:keys [source new-snapshot kept-snapshots prefix hour-of-day day-of-week]} dataset-result
+  [target-config dataset-result global-defaults]
+  (let [{:keys [target]} target-config
+        {:keys [source new-snapshot kept-snapshots prefix]} dataset-result
 
         ;; Retention settings for target
-        preserve-min-raw (or target-preserve-min
-                             (:target-preserve-min global-defaults)
-                             :all)
-        preserve-raw (or target-preserve
-                         (:target-preserve global-defaults)
-                         :no)
-
-        preserve-min (normalize-preserve-min preserve-min-raw)
-        preserve (normalize-preserve preserve-raw)
-
-        target-hour (or (:preserve-hour-of-day target-config) hour-of-day)
-        target-day (or (:preserve-day-of-week target-config) day-of-week)
+        {:keys [preserve-min-raw preserve-raw preserve-min preserve
+                hour-of-day day-of-week week-of-month month-of-year]}
+          (compute-retention-settings target-config
+                                      global-defaults
+                                      :target-preserve-min
+                                      :target-preserve)
 
         ;; Get target snapshots
         target-snapshots (snapshots target)
@@ -420,9 +461,23 @@
         common (find-common-snapshot kept-snapshots target-managed)
         incremental-base (when common (str source "@" common))
 
-        ;; Send new snapshot
-        ;; TODO: should this depend on retention policy?
-        _ (when (and new-snapshot (not dry-run?))
+        ;; Check if new snapshot would be kept after applying retention
+        would-keep-new? (when new-snapshot
+                          (let [target-snapshot-name (str target "@" (snapshot-rest new-snapshot))
+                                target-with-new (conj target-managed target-snapshot-name)
+                                {keep-with-new :keep}
+                                  (apply-retention target-with-new
+                                                   prefix
+                                                   preserve-min
+                                                   preserve
+                                                   hour-of-day
+                                                   day-of-week
+                                                   week-of-month
+                                                   month-of-year)]
+                            (contains? (set keep-with-new) target-snapshot-name)))
+
+        ;; Send new snapshot only if it would be kept
+        _ (when (and new-snapshot would-keep-new?)
             (try
               (send-snapshot new-snapshot target incremental-base)
               (catch Exception e
@@ -434,42 +489,44 @@
                            prefix
                            preserve-min
                            preserve
-                           target-hour
-                           target-day)]
+                           hour-of-day
+                           day-of-week
+                           week-of-month
+                           month-of-year)]
 
     (println "\n  Target:" target)
     (println "    target-preserve-min:" (format-preserve-min preserve-min-raw))
     (println "    target-preserve:" (format-preserve preserve-raw))
     (println "    Keeping" (count keep-target) "target snapshots")
     (println "    Destroying" (count destroy-target) "target snapshots")
-    (when incremental-base
-      (println "    Using incremental base:" incremental-base))
+    (if-not would-keep-new?
+      (println "    Skipped send: new snapshot would be immediately removed")
+      (when incremental-base
+        (println "    Used incremental base:" incremental-base)))
 
     ;; Destroy old target snapshots
     (doseq [snap destroy-target]
-      (if dry-run?
-        (println "    [DRY RUN] Would destroy:" snap)
-        (destroy-snapshot snap)))))
+      (destroy-snapshot snap))))
 
 ;; === Main Processing ===
 
 (defn process-config
-  [config dry-run?]
+  [config]
   (let [{:keys [global datasets]} config
         defaults (or global {})]
 
     (println "=== ztrbk - ZFS Snapshot Manager ===")
-    (when dry-run? (println "\n*** DRY RUN MODE ***\n"))
+    (when *dry-run* (println "\n*** DRY RUN MODE ***\n"))
 
     (doseq [dataset-config datasets]
       (try
-        (let [dataset-result (process-dataset dataset-config defaults dry-run?)
+        (let [dataset-result (process-dataset dataset-config defaults)
               targets (:targets dataset-config)]
 
           ;; Process targets
           (doseq [target targets]
             (try
-              (process-target target dataset-result defaults dry-run?)
+              (process-target target dataset-result defaults)
               (catch Exception e
                 (println "  Error processing target:" (.getMessage e))))))
 
@@ -478,22 +535,25 @@
 
 ;; === CLI ===
 
-(defn print-usage
+(defn usage
   []
   (println "Usage: ztrbk [options] <command>")
   (println "")
   (println "Commands:")
   (println "  run        Execute snapshot creation and replication")
-  (println "  dryrun     Show what would be done without making changes")
   (println "")
   (println "Options:")
+  (println "  -h, --help           Display this help message and exit")
   (println "  -c, --config FILE    Use specified config file (default: /etc/ztrbk.conf)")
+  (println "  -n, --dry-run        Show what would be done without making changes")
   (println "")
   (println "Example config file (EDN format):")
   (println "")
   (println "{:global {:prefix \"ztrbk_\"")
   (println "          :preserve-hour-of-day 0")
   (println "          :preserve-day-of-week :sunday")
+  (println "          :preserve-week-of-month 1")
+  (println "          :preserve-month-of-year :january")
   (println "          :snapshot-preserve-min :all")
   (println "          :snapshot-preserve :no")
   (println "          :target-preserve-min :all")
@@ -515,6 +575,17 @@
   (println "   :targets [{:target \"tank/temp-backup\"")
   (println "              :target-preserve-min :latest")
   (println "              :target-preserve :no}]}]}")
+  (println "")
+  (println "Global and per-dataset/target configuration:")
+  (println "  :prefix                    - Snapshot name prefix (default: \"ztrbk_\")")
+  (println "  :preserve-hour-of-day      - Hour when day starts (0-23, default: 0)")
+  (println "  :preserve-day-of-week      - Day for weekly snapshots (:sunday-:saturday, or 0-7, default: :sunday)")
+  (println "  :preserve-week-of-month    - Week for monthly snapshots (1-4, default: 1)")
+  (println "  :preserve-month-of-year    - Month for yearly snapshots (:january-:december, or 1-12, default: :january)")
+  (println "  :snapshot-preserve-min     - Local snapshot retention minimum (default: :all)")
+  (println "  :snapshot-preserve         - Local snapshot tiered retention (default: :no)")
+  (println "  :target-preserve-min       - Target snapshot retention minimum (default: :all)")
+  (println "  :target-preserve           - Target snapshot tiered retention (default: :no)")
   (println "")
   (println "Preserve min values:")
   (println "  :all               - Keep everything forever (default)")
@@ -538,40 +609,39 @@
   (println "  1. preserve-min: Keep ALL snapshots within this duration")
   (println "  2. preserve: Keep specific snapshots (hourly/daily/weekly/monthly/yearly)")
   (println "     - Snapshots within preserve-min are already kept")
-  (println "     - preserve adds ADDITIONAL snapshots beyond preserve-min")
-  (System/exit 1))
+  (println "     - preserve adds ADDITIONAL snapshots beyond preserve-min"))
 
 (defn -main
   [& args]
   (let [parsed (loop [args args
                       config-path default-config-path
-                      command nil]
+                      command nil
+                      dry-run? false]
                  (if-let [arg (first args)]
                    (case arg
-                     ("-c" "--config") (recur (drop 2 args) (second args) command)
-                     ("run" "dryrun") (recur (rest args) config-path arg)
+                     ("-h" "--help") (do (usage) (System/exit 0))
+                     ("-c" "--config") (recur (drop 2 args) (second args) command dry-run?)
+                     ("-n" "--dry-run") (recur (rest args) config-path command true)
+                     "run" (recur (rest args) config-path arg dry-run?)
                      (do
                        (println "Unknown argument:" arg)
-                       (print-usage)))
-                   {:config-path config-path :command command}))]
+                       (System/exit 1)))
+                   {:config-path config-path :command command :dry-run dry-run?}))
+        {:keys [config-path command dry-run?]} parsed]
 
-    (when-not (:command parsed)
-      (print-usage))
+    (when-not command
+      (println "No command specified.")
+      (println "Use -h for help.")
+      (System/exit 1))
 
-    (let [config-path (:config-path parsed)
-          command (:command parsed)
-          dry-run? (= command "dryrun")]
+    (when-not (.exists (io/file config-path))
+      (println "Config file not found:" config-path)
+      (System/exit 1))
 
-      (when-not (.exists (io/file config-path))
-        (println "Config file not found:" config-path)
-        (System/exit 1))
-
-      (try
-        (let [config (load-config config-path)]
-          (process-config config dry-run?))
-        (catch Exception e
-          (println "Error:" (.getMessage e))
-          (System/exit 1))))))
+    (binding [*dry-run* dry-run?
+              *now* (java.time.LocalDateTime/now)]
+      (let [config (load-config config-path)]
+        (process-config config)))))
 
 (when (= *file* (System/getProperty "babashka.file"))
   (apply -main *command-line-args*))
