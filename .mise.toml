@@ -1,4 +1,3 @@
 [tools]
 babashka = "1.4.192"
-java = "oracle-graalvm"
-zprint = "1.3.0"
+java = "25"
