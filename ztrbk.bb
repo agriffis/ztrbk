@@ -97,7 +97,7 @@
                         ["zfs send -w -i" incremental-base snapshot-name]
                         ["zfs send -w" snapshot-name])
              recv-cmd ["zfs receive -e" target-dataset]
-             _ (apply println (if *dry-run* "[DRY RUN]" "[RUN]") send-cmd "|" recv-cmd)
+             _ (apply println (if *dry-run* "[DRY RUN]" "[RUN]") (concat send-cmd ["|"] recv-cmd))
              proc (when-not *dry-run*
                     (p/pipeline (as-> (apply p/process {:err :inherit} send-cmd) prev
                                   (apply p/shell prev recv-cmd))))]
