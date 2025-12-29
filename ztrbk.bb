@@ -12,10 +12,11 @@
 ;; http://creativecommons.org/publicdomain/zero/1.0/
 ;;======================================================================
 
-(require '[clojure.edn :as edn]
-         '[clojure.string :as str]
-         '[clojure.java.io :as io]
-         '[babashka.process :as p])
+(ns ztrbk
+  (:require [babashka.process :as p]
+            [clojure.edn :as edn]
+            [clojure.java.io :as io]
+            [clojure.string :as str]))
 
 ;; === Configuration ===
 
@@ -38,7 +39,7 @@
          (remove str/blank?)
          set)))
 
-(defn snapshots
+(defn list-snapshots
   [dataset]
   (or (get @_snapshots dataset)
       (let [fetched (fetch-snapshots dataset)]
@@ -55,7 +56,7 @@
 
 (defn snapshot-exists?
   [snapshot-name]
-  (let [snaps (snapshots (snapshot-dataset snapshot-name))]
+  (let [snaps (list-snapshots (snapshot-dataset snapshot-name))]
     (boolean (snaps snapshot-name))))
 
 (defn create-snapshot
@@ -406,7 +407,7 @@
         new-snapshot (create-snapshot source prefix timestamp)
 
         ;; Get all snapshots
-        all-snapshots (snapshots source)
+        all-snapshots (list-snapshots source)
         managed (filter-managed-snapshots all-snapshots prefix)
 
         ;; Apply retention
@@ -461,7 +462,7 @@
                                       :target-preserve)
 
         ;; Get target snapshots
-        target-snapshots (snapshots target)
+        target-snapshots (list-snapshots target)
         target-managed (filter-managed-snapshots target-snapshots prefix)
 
         ;; Find incremental base
@@ -551,7 +552,7 @@
   (println "")
   (println "Options:")
   (println "  -h, --help           Display this help message and exit")
-  (println "  -c, --config FILE    Use specified config file (default: /etc/ztrbk.conf)")
+  (println "  -c, --config FILE    Use specified config file (default: /etc/ztrbk.edn)")
   (println "  -n, --dry-run        Show what would be done without making changes")
   (println "")
   (println "Example config file (EDN format):")
