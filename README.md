@@ -2,6 +2,10 @@
 
 ZFS snapshot manager inspired by [btrbk](https://github.com/digint/btrbk)
 
+> [!WARNING]
+> This project is in early development and may not be suitable for production
+> use yet. Use at your own risk!
+
 ## Introduction
 
 ztrbk is a lightweight backup and snapshot management tool for ZFS filesystems, written in Clojure using [Babashka](https://babashka.org/). It automates snapshot creation, replication to target datasets, with flexible retention policies similar to btrbk.
