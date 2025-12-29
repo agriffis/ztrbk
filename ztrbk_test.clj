@@ -60,7 +60,10 @@
                                   {:days 5}
                                   0 7 1 1)]
       ;; Should keep daily snapshots within the last 5 days
-      (is (= 3 (count (:keep result))))
+      (is (= ["tank/data@test_2024-01-10_00-00"
+              "tank/data@test_2024-02-01_00-00"
+              "tank/data@test_2024-03-01_00-00"]
+             (:keep result)))
       (is (= 4 (count (:destroy result)))))))
 
 (deftest preserve-weeks-test
@@ -70,8 +73,9 @@
                                   {:type :no}
                                   {:weeks 4}
                                   0 7 1 1)]
-      ;; Should keep weekly snapshots
-      (is (<= (count (:keep result)) 4)))))
+      ;; Should keep one snapshot per week within the last 4 weeks
+      (is (= ["tank/data@test_2024-03-01_00-00"]
+             (:keep result))))))
 
 (deftest preserve-months-test
   (binding [ztrbk/*now* (java.time.LocalDateTime/parse "2024-06-01T00:00"
@@ -80,11 +84,8 @@
                                   {:type :no}
                                   {:months 3}
                                   0 7 1 1)]
-      ;; Should keep monthly snapshots from Jan, Feb, Mar
-      (is (= 3 (count (:keep result))))
-      (is (= ["tank/data@test_2024-01-01_00-00"
-              "tank/data@test_2024-02-01_00-00"
-              "tank/data@test_2024-03-01_00-00"] (:keep result))))))
+      ;; Should keep monthly snapshots within the last 3 months
+      (is (= ["tank/data@test_2024-03-01_00-00"] (:keep result))))))
 
 (deftest preserve-combined-test
   (binding [ztrbk/*now* (java.time.LocalDateTime/parse "2024-04-01T00:00"
