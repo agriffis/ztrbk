@@ -106,11 +106,18 @@
 
 ;; === Timestamp Parsing ===
 
+(def ^:dynamic *now* nil)
+
 (def ^:dynamic *timestamp-format-str* "yyyy-MM-dd_HH-mm")
 
 (def timestamp-formatter
   (memoize (fn [format-str]
              (java.time.format.DateTimeFormatter/ofPattern format-str))))
+
+(defn get-timestamp
+  []
+  (-> (or *now* (java.time.LocalDateTime/now))
+      (.format (timestamp-formatter *timestamp-format-str*))))
 
 (defn parse-timestamp
   "Attempt to parse timestamp string, returning nil on failure"
@@ -130,8 +137,6 @@
         (parse-timestamp ts-str)))))
 
 ;; === Retention Policy ===
-
-(def ^:dynamic *now* nil)
 
 (defn time-ago
   ([duration-amount duration-unit]
@@ -396,8 +401,7 @@
   (let [{:keys [source prefix]} dataset-config
         prefix (or prefix (:prefix global-defaults) "ztrbk_")
         recursive (get (merge global-defaults dataset-config) :recursive true)
-        timestamp
-          (.format timestamp-formatter (or *now* (java.time.LocalDateTime/now)))
+        timestamp (get-timestamp)
 
         ;; Retention settings
         {:keys [preserve-min-raw preserve-raw preserve-min preserve
