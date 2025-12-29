@@ -647,7 +647,7 @@
                      (do
                        (println "Unknown argument:" arg)
                        (System/exit 1)))
-                   {:config-path config-path :command command :dry-run dry-run? :safe safe?}))
+                   {:config-path config-path :command command :dry-run? dry-run? :safe? safe?}))
         {:keys [config-path command dry-run? safe?]} parsed]
 
     (when-not command
