@@ -97,6 +97,36 @@
       ;; Should keep combination of daily, weekly, and monthly
       (is (>= (count (:keep result)) 3)))))
 
+(deftest preserve-hour-of-day-test
+  (binding [ztrbk/*now* (java.time.LocalDateTime/parse "2024-01-03T06:00"
+                                                       (java.time.format.DateTimeFormatter/ofPattern "yyyy-MM-dd'T'HH:mm"))]
+    (let [result-hour-0 (apply-retention snapshots prefix
+                                         {:type :no}
+                                         {:days 2}
+                                         0 7 1 1)
+          result-hour-3 (apply-retention snapshots prefix
+                                         {:type :no}
+                                         {:days 2}
+                                         3 7 1 1)]
+      ;; With hour-of-day=0, snapshots group by calendar day.
+      ;; Keeps one snapshot per day for the last 2 days.
+      ;; Extras on the end because they are stamped after *now*.
+      (is (= ["tank/data@test_2024-01-01_12-00"
+              "tank/data@test_2024-01-02_00-00"
+              "tank/data@test_2024-01-03_00-00"
+              "tank/data@test_2024-01-10_00-00"
+              "tank/data@test_2024-02-01_00-00"
+              "tank/data@test_2024-03-01_00-00"]
+             (:keep result-hour-0)))
+      ;; With hour-of-day=3, the Jan 2 00:00 snapshot (before 3am) shifts to Jan 1.
+      ;; This causes it to be filtered out as it becomes a different day.
+      (is (= ["tank/data@test_2024-01-01_12-00"
+              "tank/data@test_2024-01-03_00-00"
+              "tank/data@test_2024-01-10_00-00"
+              "tank/data@test_2024-02-01_00-00"
+              "tank/data@test_2024-03-01_00-00"]
+             (:keep result-hour-3))))))
+
 (deftest alt-prefix-filtered-out-test
   (let [result (apply-retention snapshots prefix
                                 {:type :all} nil
