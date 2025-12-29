@@ -27,6 +27,7 @@
   (edn/read-string (slurp path)))
 
 (def ^:dynamic *dry-run* false)
+(def ^:dynamic *safe* false)
 
 ;; === ZFS Operations ===
 
@@ -78,8 +79,8 @@
   [snapshot-name]
   (when (snapshot-exists? snapshot-name)
     (let [cmd ["zfs destroy" snapshot-name]]
-      (println (if *dry-run* "[DRY RUN]" "[RUN]") cmd)
-      (when-not *dry-run*
+      (println (if (or *dry-run* *safe*) "[DRY RUN]" "[RUN]") cmd)
+      (when-not (or *dry-run* *safe*)
         (apply p/shell cmd)))
     (let [dataset (snapshot-dataset snapshot-name)]
       (swap! _snapshots update dataset disj snapshot-name))))
@@ -528,6 +529,7 @@
 
     (println "=== ztrbk - ZFS snapshot manager ===")
     (when *dry-run* (println "\n*** DRY RUN MODE ***\n"))
+    (when *safe* (println "\n*** SAFE MODE ***\n"))
 
     (doseq [dataset-config datasets]
       (try
@@ -557,6 +559,7 @@
   (println "  -h, --help           Display this help message and exit")
   (println "  -c, --config FILE    Use specified config file (default: /etc/ztrbk.edn)")
   (println "  -n, --dry-run        Show what would be done without making changes")
+  (println "  -s, --safe           Perform operations except zfs destroy")
   (println "")
   (println "Example config file (EDN format):")
   (println "")
@@ -628,18 +631,20 @@
   (let [parsed (loop [args args
                       config-path default-config-path
                       command nil
-                      dry-run? false]
+                      dry-run? false
+                      safe? false]
                  (if-let [arg (first args)]
                    (case arg
                      ("-h" "--help") (do (usage) (System/exit 0))
-                     ("-c" "--config") (recur (drop 2 args) (second args) command dry-run?)
-                     ("-n" "--dry-run") (recur (rest args) config-path command true)
-                     "run" (recur (rest args) config-path arg dry-run?)
+                     ("-c" "--config") (recur (drop 2 args) (second args) command dry-run? safe?)
+                     ("-n" "--dry-run") (recur (rest args) config-path command true safe?)
+                     ("-s" "--safe") (recur (rest args) config-path command dry-run? true)
+                     "run" (recur (rest args) config-path arg dry-run? safe?)
                      (do
                        (println "Unknown argument:" arg)
                        (System/exit 1)))
-                   {:config-path config-path :command command :dry-run dry-run?}))
-        {:keys [config-path command dry-run?]} parsed]
+                   {:config-path config-path :command command :dry-run dry-run? :safe safe?}))
+        {:keys [config-path command dry-run? safe?]} parsed]
 
     (when-not command
       (println "No command specified.")
@@ -651,6 +656,7 @@
       (System/exit 1))
 
     (binding [*dry-run* dry-run?
+              *safe* safe?
               *now* (java.time.LocalDateTime/now)]
       (let [config (load-config config-path)]
         (process-config config)))))
