@@ -1,0 +1,20 @@
+{:comment {:inline-align-style :none, :wrap? false}
+ :fn-force-nl #{:binding}
+ :fn-gt2-force-nl #{:pair-fn}
+ :fn-map {"->>" :none-body
+          "catch" :arg2-force-nl-body
+          "define" :arg1-body
+          "defn" :arg1-force-nl
+          "json/read-str" :arg1-pair
+          "locking" :arg1-body
+          "some->" :noarg1-body
+          "some->>" :none-body
+          "try" :flow-body
+          "finally" :flow-body
+          "thrown?" :arg1-body}
+ :list {:constant-pair-min 3 :constant-pair-fn keyword?}
+ :map {:comma? false}
+ :remove {:fn-force-nl #{:noarg1 :noarg1-body}}
+ :style [:sort-require :respect-bl :respect-nl]
+ :vector {:no-wrap-after #{"&"}}
+ :width 120}
