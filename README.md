@@ -128,18 +128,10 @@ Create `/etc/ztrbk.edn` with your backup policy:
 2. `preserve` keeps specific snapshots (hourly/daily/weekly/monthly/yearly) beyond preserve-min
 3. Snapshots are destroyed only if they fall outside both policies
 
-## Feature Differences from btrbk
+## Differences from btrbk
 
-While ztrbk is inspired by btrbk's approach to snapshot management, there are several key differences:
+While ztrbk is inspired by btrbk's approach to snapshot management, there are several differences:
 
-### Similarities
-- Two-tier retention policy (preserve-min + preserve)
-- Support for hourly, daily, weekly, monthly, yearly retention periods
-- Incremental replication
-- Dry-run mode
-- Flexible configuration
-
-### Differences
 
 | Feature | btrbk | ztrbk |
 |---------|-------|-------|
