@@ -31,22 +31,6 @@
 
 ;; === ZFS Operations ===
 
-(def _snapshots (atom nil))
-
-(defn fetch-snapshots
-  [dataset]
-  (let [proc (p/shell {:out :string} "zfs list -H -t snapshot -o name -r" dataset)]
-    (->> (str/split-lines (:out proc))
-         (remove str/blank?)
-         set)))
-
-(defn list-snapshots
-  [dataset]
-  (or (get @_snapshots dataset)
-      (let [fetched (fetch-snapshots dataset)]
-        (swap! _snapshots assoc dataset fetched)
-        fetched)))
-
 (defn snapshot-dataset
   [snapshot-name]
   (first (str/split snapshot-name #"@")))
@@ -54,6 +38,23 @@
 (defn snapshot-rest
   [snapshot-name]
   (second (str/split snapshot-name #"@")))
+
+(def _snapshots (atom nil))
+
+(defn fetch-snapshots!
+  [dataset]
+  (let [proc (p/shell {:out :string} "zfs list -H -t snapshot -o name -r" dataset)
+        recursive-snapshots (->> (str/split-lines (:out proc))
+                                 (remove str/blank?))
+        by-dataset (-> (group-by snapshot-dataset recursive-snapshots)
+                       (update-vals set))]
+    (swap! _snapshots merge by-dataset)
+    (get by-dataset dataset)))
+
+(defn list-snapshots
+  [dataset]
+  (or (get @_snapshots dataset)
+      (fetch-snapshots! dataset)))
 
 (defn snapshot-exists?
   [snapshot-name]
@@ -71,7 +72,11 @@
         (apply println (if *dry-run* "[DRY RUN]" "[RUN]") cmd)
         (when-not *dry-run*
           (apply p/shell cmd)))
-      (swap! _snapshots update dataset conj snapshot-name)
+      (if-not recursive
+        ;; If not recursive, we can add the single snapshot directly rather than
+        ;; re-fetching all snapshots for the dataset.
+        (swap! _snapshots update dataset conj snapshot-name)
+        (fetch-snapshots! dataset))
       snapshot-name)))
 
 (defn destroy-snapshot
@@ -458,7 +463,7 @@
       (last (sort common)))))
 
 (defn process-target
-  [target-config dataset-result global-defaults]
+  [target-config dataset-result dataset-defaults]
   (let [{:keys [target]} target-config
         {:keys [source new-snapshot kept-snapshots prefix]} dataset-result
 
@@ -466,7 +471,7 @@
         {:keys [preserve-min-raw preserve-raw preserve-min preserve
                 hour-of-day day-of-week week-of-month month-of-year]}
           (compute-retention-settings target-config
-                                      global-defaults
+                                      dataset-defaults
                                       :target-preserve-min
                                       :target-preserve)
 
@@ -538,12 +543,13 @@
     (doseq [dataset-config datasets]
       (try
         (let [dataset-result (process-dataset dataset-config defaults)
+              dataset-defaults (merge defaults dataset-config)
               targets (:targets dataset-config)]
 
           ;; Process targets
           (doseq [target targets]
             (try
-              (process-target target dataset-result defaults)
+              (process-target target dataset-result dataset-defaults)
               (catch Exception e
                 (println "  Error processing target:" (.getMessage e))))))
 
