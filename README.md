@@ -3,8 +3,7 @@
 ZFS snapshot manager inspired by [btrbk](https://github.com/digint/btrbk)
 
 > [!WARNING]
-> This project is in early development and may not be suitable for production
-> use yet. Use at your own risk!
+> # This project is in early development and has lots of bugs.
 
 ## Introduction
 
