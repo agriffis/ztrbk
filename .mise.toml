@@ -1,4 +1,0 @@
-[tools]
-babashka = "1.4.192"
-java = "25"
-zprint = "1.3.0"

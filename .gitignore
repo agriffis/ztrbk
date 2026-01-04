@@ -1,5 +1,0 @@
-.clj-kondo
-!.clj-kondo/config.edn
-.lsp
-!.lsp/config.edn
-.nrepl-port
